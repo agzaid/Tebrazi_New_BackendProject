@@ -52,7 +52,9 @@ public interface IOrganizationStore
 /// <summary>Session issuance and revocation, backing the active-sessions screen.</summary>
 public interface ISessionStore
 {
-    Task<IReadOnlyList<Session>> ListForUserAsync(string userId, CancellationToken ct = default);
+    /// <summary>The user's sessions, newest first, INCLUDING expired ones — expiry is the handler's gate.</summary>
+    Task<IReadOnlyList<Session>> ListForUserIncludingExpiredAsync(string userId, CancellationToken ct = default);
+    Task<Session?> GetByTokenAsync(string userId, string token, CancellationToken ct = default);
     Task<Session?> GetForUpdateAsync(string id, CancellationToken ct = default);
     void Add(Session session);
     void Remove(Session session);
@@ -68,4 +70,6 @@ public interface ITokenStore
     void Add(PasswordResetToken token);
     void Add(Invitation invitation);
     void Add(OtpCode code);
+    /// <summary>How many codes were issued for a phone since a moment — the request-otp limiter.</summary>
+    Task<int> CountOtpIssuedSinceAsync(string phone, DateTime since, CancellationToken ct = default);
 }

@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Tebrazi.Identity.Domain\Tebrazi.Identity.Domain.csproj" />
     <ProjectReference Include="..\..\..\Kernel\Tebrazi.SharedKernel\Tebrazi.SharedKernel.csproj" />
+    <ProjectReference Include="..\..\Documents\Tebrazi.Documents.Application\Tebrazi.Documents.Application.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

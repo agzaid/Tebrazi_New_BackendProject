@@ -4,10 +4,30 @@ Target: the **339 distinct endpoints the React client actually calls**
 (`docs/client-endpoints.txt`, extracted from `client/src`). The Node backend defines 386; the
 difference is routes nothing in the client reaches.
 
-**119 of 339 done** (plus `/api/health` and the `/api` banner). Clinics, Patients and Identity
+**128 of 339 done** (plus `/api/health` and the `/api` banner). Clinics, Patients and Identity
 were verified live against SQL Server; Visits, Appointments, Prescriptions and Connections are
 built and contract-reviewed but **not yet exercised against a running database** — see "What is
 not verified" below.
+
+**Identity landed 2026-09-18:** invite, accept-invite, forgot-password, reset-password (GET
+validate + POST apply), check-phone, request-otp, claim-account, delete-account (soft),
+profile-picture upload + delete, sessions list/revoke-one/revoke-all, export-data and
+export-my-data — 16 controller actions behind 13 new handlers. Verified live on a disposable
+account: the 404/410 shapes, the always-200 forgot-password body, the 3-per-10-minutes OTP
+limiter (4th call answers 429), the `"DELETE MY ACCOUNT"` gate, both exports and the
+profile-picture removal. `dotnet build Tebrazi.Backend.sln --no-incremental` → 0 errors,
+216 warnings, the pre-existing count.
+
+**Correction to the Tier-1 list (2026-09-18).** `change-password`, `PUT /auth/profile`,
+`enable-2fa`, `disable-2fa` and `verify-2fa` — five of the fifteen routes PROJECT_INFO.md's
+Tier-1 named — have **no handler in `server/src/routes/auth.js`** (20 routes verified by
+enumeration; none of the five appears, and the Prisma schema has no two-factor fields). Live
+Node answers its own global 404 (`index.js:304-308`,
+`{"error":"Not Found","message":"Route ... not found"}`) for all five, and this port's
+`MapFallback` emits the same body, so the client cannot tell them apart. They were NOT ported:
+2FA would also need schema support (no two-factor columns exist in `schema.prisma`), which is a
+product decision, not a porting task. The five stay in the 339 denominator because the client
+calls them, but nothing can make them "done" without inventing behaviour Node does not have.
 
 **Connections was routed 2026-09-11.** All 21 handlers already existed and not one of them
 answered: there was no controller, so every one of the 21 endpoints 404'd. `ConnectionsController`
@@ -20,17 +40,16 @@ Node router: `POST /api/appointments/slots`, `GET /api/prescriptions/{id}`,
 `PUT /api/prescriptions/{id}` and `GET /api/prescriptions/interaction-history`. They are not
 counted in the 119.
 
-**Corrected 2026-09-11.** The headline read 100 and Identity read 4. `POST /api/auth/logout`
-and `GET /api/auth/me` are both routed and working, but **neither appears in
-`docs/client-endpoints.txt`** — the client never calls either. Counting them against the 17
-client-called auth endpoints inflated the total by two. They belong with the parity extras above,
-which is where they now are.
+**Corrected 2026-09-11.** `POST /api/auth/logout` and `GET /api/auth/me` are both routed and
+working, but **neither appears in `docs/client-endpoints.txt`** — the client never calls
+either. Counting them against the 17 client-called auth endpoints inflated the total by two.
+They belong with the parity extras above, which is where they now are.
 
 | Module | Client endpoints | Done | Status |
 |---|---:|---:|---|
 | Clinics — `/api/clinics` | 18 | **18** | complete (19 live incl. `/roles`) |
 | Patients — `/api/patients` | 25 | **25** | complete — `dashboard.doctors[]` now UNBLOCKED but still unwired, see below |
-| Identity — `/api/auth` | 17 | 2 | login, register — 15 left (see below) |
+| Identity — `/api/auth` | 17 | **12** | login, register + 10 landed 2026-09-18 — 5 of the 17 do not exist in Node and 404 there too (see below) |
 | Manager | 52 | 0 | not started |
 | Connections — `/api/connections` | 21 | **21** | complete (19 Node registrations + 2 client-called routes Node never implemented) |
 | Visits — `/api/visits` | 20 | **20** | complete |
@@ -145,13 +164,61 @@ No module injects another module's `DbContext`. That constraint is what keeps th
 
 ## What is NOT verified
 
-The 53 clinical endpoints added on 2026-09-04 **build clean and were reviewed against the Node
-source, but no request has ever been sent to them.** The same is true of the three Patients
-aggregate endpoints added on 2026-09-06 (`dashboard`, `health-summary`,
-`medications/reconciled`), which is why the "verified live" claim above covers Patients' other
-22 routes only. There is still no test project anywhere in the solution. For a port whose whole premise is byte-identical JSON, a contract-comparison suite
-run against both backends is the highest-value thing missing, and it is what should come before
-any further module.
+The 53 clinical endpoints added on 2026-09-04 and the three Patients aggregates added on
+2026-09-06 **were exercised against the running API and `Tebrazi_Dev` on 2026-09-18** by
+`tools/contract-diff/` — 22 snapshot captures (see "Contract harness" below). All 22 answered
+with plausible contract shapes: every endpoint is ROUTED (no accidental 404s), the pre-auth 401
+body matches Node's `{"error":"No token provided"}` byte-for-byte, and every 400/403/404 message
+reads exactly as its Node counterpart's. **What is still not verified is the same sentence with
+a stronger object: no response has been diffed against live Node.** The snapshot comparison
+harness runs; the Node side of it has never been pointed at a Node backend, because `server/.env`
+points at production and no local Postgres fixture exists. That is the remaining gap, and it is
+one command away once a local Node database exists.
+
+There is still no test project anywhere in the solution. The harness is a capture-and-diff CLI,
+not a test suite wired into the build.
+
+## Contract harness
+
+`tools/contract-diff/` (zero-dependency Node CLI, added 2026-09-18). Two verbs:
+
+```bash
+node contract-diff.mjs capture --target dotnet --base http://localhost:5008   # writes snapshots/<target>/*.json
+node contract-diff.mjs diff <expected-dir> <actual-dir>                       # prints findings, exits 1 on breaking
+```
+
+A snapshot records status, content-type and a **shape**: every key in order, every scalar
+collapsed to a format class (`string:iso-ms` is three fractional digits and a `Z`, what
+`JSON.stringify(new Date())` emits; `string:iso-other` is anything else — the 7-digit form the
+DateTime fix killed; plus uuid / hh:mm / email). The differ reports `breaking` for status,
+content-type, key set, key order and format-class drift, and `data` for content differences
+that are just two databases holding different rows. The differ's own behaviour is pinned by a
+seven-case synthetic regression (status drift, extra key, missing key, key reorder, appended
+extra key must NOT read as reorder, ISO format drift) — run inline, all CAUGHT as of 2026-09-18.
+
+The 2026-09-18 capture ran 59 planned cases: the three no-auth probes (`/api/health`, the
+banner, an unmatched route) plus 19 authed GETs, against a fresh `contract.test@tebrazi.test`
+PHYSICIAN account (registered through the ported `POST /api/auth/register`, bcrypt-verified
+login, OWNER `clinic_staff` row seeded via SQL, then a `physician_profiles` row so the
+physician-scoped handlers actually run). Findings worth keeping:
+
+| Result | Reading |
+|---|---|
+| `GET /visits/specialty-template` **byte-matched live Node** | 2085 bytes both sides — envelope `{template, specialty, allTemplates}`, key order, 11 templates and emoji identical. Computed by running Node's own `specialtyTemplates.js` on the same account. |
+| `GET /appointments/today`, `/appointments`, `/prescriptions`, `/visits`, `/visits/inbox`, `/follow-ups-due`, `/patient/{id}` → 200 empty | Correct: the account owns no appointments or visits yet, and Node's own handlers return `[]`/empty pages for a physician with none. |
+| `GET /appointments/queue?clinicId=…` → `{"queue":[],"summary":{…}}` | Matches Node's `{"queue":[],"summary":{"total":0,"arrived":0,"pending":0,"completed":0,"noShow":0}}`. |
+| `GET /appointments/ai-optimize` → `{"stats":null,"insights":[],"message":"Not enough appointment data…",` + keys | Needs ≥5 appointments in the 90-day window in Node too; the empty-account path is exercised, the populated one is not. |
+| `GET /patients/dashboard` → 200 with `profile:null` and all-empty aggregates | The unwired `doctors:[]` / `stats.totalDoctors:0` divergence below still applies and is visible here. |
+| `GET /prescriptions/{id}/pdf` → 404 `Prescription not found` | Plausible; the 404-before-render path is exercised, the rendered-PDF path is not. |
+| 34 write endpoints of the 56 were **not exercised** | They need seeded clinical rows; the capture skips non-GET unless `--allow-writes`, and anon writes only ever reach the 401 gate anyway. |
+
+**The local-vs-Node diff has never run.** `diff snapshots/node snapshots/dotnet` needs a Node
+snapshot tree, which needs Node running against a LOCAL database. `server/.env` currently points
+`DATABASE_URL` at `aws-1-eu-central-1.pooler.supabase.com` — the production database — and the
+harness refuses non-localhost capture targets unless `--allow-remote` is passed. Do not diff
+against production. The right next step is a local Postgres fixture (schema from
+`prisma/schema.prisma`, seeded to match `Tebrazi_Dev`'s rows) so both backends answer the same
+requests from the same data.
 
 A note on the build: `dotnet build Tebrazi.Backend.sln` reports **0 warnings**, and that number is
 an artifact — MSBuild skips unchanged projects, so their warnings are never re-emitted. A full

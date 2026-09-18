@@ -38,12 +38,17 @@ public sealed class OrganizationStore(IdentityDbContext context) : IOrganization
 
 public sealed class SessionStore(IdentityDbContext context) : ISessionStore
 {
-    public async Task<IReadOnlyList<Session>> ListForUserAsync(string userId, CancellationToken ct = default)
+    public async Task<IReadOnlyList<Session>> ListForUserIncludingExpiredAsync(string userId, CancellationToken ct = default)
         => await context.Sessions
             .AsNoTracking()
             .Where(s => s.UserId == userId)
             .OrderByDescending(s => s.CreatedAt)
             .ToListAsync(ct);
+
+    public Task<Session?> GetByTokenAsync(string userId, string token, CancellationToken ct = default)
+        => context.Sessions
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Token == token && s.UserId == userId, ct);
 
     public Task<Session?> GetForUpdateAsync(string id, CancellationToken ct = default)
         => context.Sessions.FirstOrDefaultAsync(s => s.Id == id, ct);
@@ -71,6 +76,9 @@ public sealed class TokenStore(IdentityDbContext context) : ITokenStore
             .Where(o => o.Phone == phone && o.Purpose == purpose)
             .OrderByDescending(o => o.CreatedAt)
             .FirstOrDefaultAsync(ct);
+
+    public Task<int> CountOtpIssuedSinceAsync(string phone, DateTime since, CancellationToken ct = default)
+        => context.OtpCodes.CountAsync(o => o.Phone == phone && o.CreatedAt > since, ct);
 
     public void Add(PasswordResetToken token) => context.PasswordResetTokens.Add(token);
 

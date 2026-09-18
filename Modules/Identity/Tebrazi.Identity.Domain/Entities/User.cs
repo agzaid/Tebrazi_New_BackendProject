@@ -81,4 +81,15 @@ public sealed class User : MutableEntity<string>
 
     public void SetPhone(string? phone)
         => Phone = string.IsNullOrWhiteSpace(phone) ? null : phone.Trim();
+
+    /// <summary>
+    /// The account-claim flow rewrites a stub's synthetic address with a real one. It is a
+    /// separate mutator rather than a parameter on <see cref="Create"/> so the claim handler's
+    /// intent reads at the call site.
+    /// </summary>
+    public void ReplaceEmail(string email)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(email);
+        Email = email.Trim().ToLowerInvariant();
+    }
 }
