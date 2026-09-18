@@ -1,0 +1,341 @@
+{
+  "note": "Authenticated probes against Tebrazi_Dev. Roles log in per capture run; X-Clinic-Id is injected by the runner for cases that declare clinic.",
+  "roles": {
+    "physician": {
+      "email": "contract.test@tebrazi.test",
+      "password": "ContractTest2026!"
+    }
+  },
+  "cases": [
+    {
+      "id": "anon__health",
+      "path": "/api/health"
+    },
+    {
+      "id": "anon__banner",
+      "path": "/api"
+    },
+    {
+      "id": "anon__unmatched-route",
+      "path": "/api/definitely-not-a-route"
+    },
+    {
+      "id": "anon__delete__appointments--param",
+      "method": "DELETE",
+      "path": "/api/appointments/00000000-0000-0000-0000-000000000001"
+    },
+    {
+      "id": "anon__delete__appointments-slots--param",
+      "method": "DELETE",
+      "path": "/api/appointments/slots/00000000-0000-0000-0000-000000000001"
+    },
+    {
+      "id": "anon__delete__visits--param",
+      "method": "DELETE",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001"
+    },
+    {
+      "id": "anon__delete__visits--param-investigations--param",
+      "method": "DELETE",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/investigations/00000000-0000-0000-0000-000000000001"
+    },
+    {
+      "id": "anon__delete__visits--param-patient-dismiss",
+      "method": "DELETE",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/patient-dismiss"
+    },
+    {
+      "id": "anon__get__appointments",
+      "method": "GET",
+      "path": "/api/appointments",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__appointments-ai-optimize",
+      "method": "GET",
+      "path": "/api/appointments/ai-optimize",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__appointments-available",
+      "method": "GET",
+      "path": "/api/appointments/available",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__appointments-queue",
+      "method": "GET",
+      "path": "/api/appointments/queue",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__appointments-slots",
+      "method": "GET",
+      "path": "/api/appointments/slots",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__appointments-today",
+      "method": "GET",
+      "path": "/api/appointments/today",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__patients-dashboard",
+      "method": "GET",
+      "path": "/api/patients/dashboard",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__patients-health-summary",
+      "method": "GET",
+      "path": "/api/patients/health-summary",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__patients-medications-reconciled",
+      "method": "GET",
+      "path": "/api/patients/medications/reconciled",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__prescriptions",
+      "method": "GET",
+      "path": "/api/prescriptions",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__prescriptions--param-pdf",
+      "method": "GET",
+      "path": "/api/prescriptions/00000000-0000-0000-0000-000000000001/pdf",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__prescriptions-summary",
+      "method": "GET",
+      "path": "/api/prescriptions/summary",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__visits",
+      "method": "GET",
+      "path": "/api/visits",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__visits--param",
+      "method": "GET",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__visits-follow-ups-due",
+      "method": "GET",
+      "path": "/api/visits/follow-ups-due",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__visits-inbox",
+      "method": "GET",
+      "path": "/api/visits/inbox",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__visits-patient--param",
+      "method": "GET",
+      "path": "/api/visits/patient/00000000-0000-0000-0000-000000000001",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__visits-specialty-template",
+      "method": "GET",
+      "path": "/api/visits/specialty-template",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__get__visits-specialty-template--param",
+      "method": "GET",
+      "path": "/api/visits/specialty-template/00000000-0000-0000-0000-000000000001",
+      "auth": "physician",
+      "clinicId": "dc3b3faf-1339-4ef8-a783-600f49c65952"
+    },
+    {
+      "id": "anon__patch__visits--param-patient-note",
+      "method": "PATCH",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/patient-note"
+    },
+    {
+      "id": "anon__post__appointments",
+      "method": "POST",
+      "path": "/api/appointments"
+    },
+    {
+      "id": "anon__post__appointments--param-intake-note",
+      "method": "POST",
+      "path": "/api/appointments/00000000-0000-0000-0000-000000000001/intake-note"
+    },
+    {
+      "id": "anon__post__appointments-recurring",
+      "method": "POST",
+      "path": "/api/appointments/recurring"
+    },
+    {
+      "id": "anon__post__appointments-slots-bulk",
+      "method": "POST",
+      "path": "/api/appointments/slots/bulk"
+    },
+    {
+      "id": "anon__post__appointments-slots-sync-from-hours",
+      "method": "POST",
+      "path": "/api/appointments/slots/sync-from-hours"
+    },
+    {
+      "id": "anon__post__appointments-walk-in",
+      "method": "POST",
+      "path": "/api/appointments/walk-in"
+    },
+    {
+      "id": "anon__post__prescriptions",
+      "method": "POST",
+      "path": "/api/prescriptions"
+    },
+    {
+      "id": "anon__post__prescriptions--param-refill-request",
+      "method": "POST",
+      "path": "/api/prescriptions/00000000-0000-0000-0000-000000000001/refill-request"
+    },
+    {
+      "id": "anon__post__prescriptions-check-interactions",
+      "method": "POST",
+      "path": "/api/prescriptions/check-interactions"
+    },
+    {
+      "id": "anon__post__prescriptions-extract-from-plan",
+      "method": "POST",
+      "path": "/api/prescriptions/extract-from-plan"
+    },
+    {
+      "id": "anon__post__prescriptions-transcribe-rx",
+      "method": "POST",
+      "path": "/api/prescriptions/transcribe-rx"
+    },
+    {
+      "id": "anon__post__visits",
+      "method": "POST",
+      "path": "/api/visits"
+    },
+    {
+      "id": "anon__post__visits--param-generate-soap",
+      "method": "POST",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/generate-soap"
+    },
+    {
+      "id": "anon__post__visits--param-investigations",
+      "method": "POST",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/investigations"
+    },
+    {
+      "id": "anon__post__visits--param-suggest-codes",
+      "method": "POST",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/suggest-codes"
+    },
+    {
+      "id": "anon__post__visits--param-transcribe",
+      "method": "POST",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/transcribe"
+    },
+    {
+      "id": "anon__put__appointments--param-cancel",
+      "method": "PUT",
+      "path": "/api/appointments/00000000-0000-0000-0000-000000000001/cancel"
+    },
+    {
+      "id": "anon__put__appointments--param-check-in",
+      "method": "PUT",
+      "path": "/api/appointments/00000000-0000-0000-0000-000000000001/check-in"
+    },
+    {
+      "id": "anon__put__appointments--param-complete",
+      "method": "PUT",
+      "path": "/api/appointments/00000000-0000-0000-0000-000000000001/complete"
+    },
+    {
+      "id": "anon__put__appointments--param-confirm",
+      "method": "PUT",
+      "path": "/api/appointments/00000000-0000-0000-0000-000000000001/confirm"
+    },
+    {
+      "id": "anon__put__appointments--param-no-show",
+      "method": "PUT",
+      "path": "/api/appointments/00000000-0000-0000-0000-000000000001/no-show"
+    },
+    {
+      "id": "anon__put__prescriptions--param-dispense",
+      "method": "PUT",
+      "path": "/api/prescriptions/00000000-0000-0000-0000-000000000001/dispense"
+    },
+    {
+      "id": "anon__put__prescriptions--param-refill-respond",
+      "method": "PUT",
+      "path": "/api/prescriptions/00000000-0000-0000-0000-000000000001/refill-respond"
+    },
+    {
+      "id": "anon__put__prescriptions--param-resume-medication",
+      "method": "PUT",
+      "path": "/api/prescriptions/00000000-0000-0000-0000-000000000001/resume-medication"
+    },
+    {
+      "id": "anon__put__prescriptions--param-send",
+      "method": "PUT",
+      "path": "/api/prescriptions/00000000-0000-0000-0000-000000000001/send"
+    },
+    {
+      "id": "anon__put__prescriptions--param-sign",
+      "method": "PUT",
+      "path": "/api/prescriptions/00000000-0000-0000-0000-000000000001/sign"
+    },
+    {
+      "id": "anon__put__prescriptions--param-stop-medication",
+      "method": "PUT",
+      "path": "/api/prescriptions/00000000-0000-0000-0000-000000000001/stop-medication"
+    },
+    {
+      "id": "anon__put__visits--param",
+      "method": "PUT",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001"
+    },
+    {
+      "id": "anon__put__visits--param-complete",
+      "method": "PUT",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/complete"
+    },
+    {
+      "id": "anon__put__visits--param-investigations--param",
+      "method": "PUT",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/investigations/00000000-0000-0000-0000-000000000001"
+    },
+    {
+      "id": "anon__put__visits--param-patient-feedback",
+      "method": "PUT",
+      "path": "/api/visits/00000000-0000-0000-0000-000000000001/patient-feedback"
+    }
+  ]
+}
