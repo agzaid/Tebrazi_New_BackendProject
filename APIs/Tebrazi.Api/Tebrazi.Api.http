@@ -1,0 +1,6 @@
+@Tebrazi.Api_HostAddress = http://localhost:5008
+
+GET {{Tebrazi.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

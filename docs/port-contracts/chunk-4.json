@@ -1,0 +1,248 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/",
+      "nodeLines": "L82-L168",
+      "summary": "Dual-persona visit list. PHYSICIAN userType gets their own visits (filterable by clinicId, status, patientUserId, subprofileId) with full SOAP + raw notes + a patientUser block resolved either from ClinicPatient or User. Any other userType (PATIENT, RECEPTIONIST, STAFF) gets only their own visits where status IN (COMPLETED, ARCHIVED) and patientDismissedAt IS NULL, with all SOAP/raw/audio keys DELETED from the object. Always wrapped in {data, pagination}.",
+      "auth": "router.use(authCheck) — JWT Bearer only. No aiUsageCheck, no auditLog, no cacheMiddleware. In-handler branch on req.user.userType === 'PHYSICIAN'; ownership enforced by where.physicianId = <own physician profile id> (physician) or where.patientUserId = req.user.id (everyone else).",
+      "successStatus": 200,
+      "responseShape": "PHYSICIAN branch:\n{\n  \"data\": [\n    {\n      \"id\": \"uuid\",\n      \"organizationId\": \"uuid\",\n      \"clinicId\": \"uuid\",\n      \"physicianId\": \"uuid\",\n      \"patientUserId\": \"uuid\",\n      \"subprofileId\": \"uuid\"|null,\n      \"clinicPatientId\": \"uuid\"|null,\n      \"status\": \"IN_PROGRESS\"|\"COMPLETED\"|\"CANCELLED\"|\"ARCHIVED\",\n      \"audioUrl\": \"string\"|null,\n      \"rawTranscript\": \"string\"|null,\n      \"rawNotes\": \"string\"|null,\n      \"subjective\": \"string\"|null,\n      \"objective\": \"string\"|null,\n      \"assessment\": \"string\"|null,\n      \"plan\": \"string\"|null,\n      \"chiefComplaint\": \"string\"|null,\n      \"diagnosis\": [\"string\"],                 // String[] @default([]) — ALWAYS an array, NEVER null; [] when empty\n      \"diagnosisCodes\": null|[{\"code\":\"E11.9\",\"description\":\"...\"}],  // free-form Json?, shape not enforced\n      \"followUpDate\": \"2026-09-10T00:00:00.000Z\"|null,   // ISO-8601 string w/ ms + Z\n      \"followUpNotes\": \"string\"|null,\n      \"sharedSections\": null|[\"subjective\",\"objective\",\"assessment\",\"plan\"],  // raw Json?, NOT coerced on this route\n      \"patientFeedback\": \"string\"|null,\n      \"patientFeedbackAt\": \"ISO\"|null,\n      \"patientDismissedAt\": \"ISO\"|null,\n      \"visitDate\": \"ISO\",                     // non-null\n      \"specialtyData\": null|{\"<fieldKey>\":\"string\", \"__templateKey\":\"ophthalmology\"},\n      \"completedAt\": \"ISO\"|null,\n      \"createdAt\": \"ISO\",\n      \"updatedAt\": \"ISO\",\n      \"deletedAt\": null,                      // always null here (softDeleteFilter), but the KEY IS PRESENT\n      \"clinic\":     { \"id\": \"uuid\", \"name\": \"string\", \"specialty\": \"string\"|null },\n      \"physician\":  { \"id\": \"uuid\", \"specialty\": \"string\", \"user\": { \"displayName\": \"string\" } },\n      \"subprofile\": null|{ \"id\": \"uuid\", \"name\": \"string\", \"relation\": \"SELF\"|\"SPOUSE\"|\"CHILD\"|\"PARENT\"|\"SIBLING\"|\"OTHER\" },\n      \"clinicPatient\": null|{ \"id\": \"uuid\", \"name\": \"string\", \"phone\": \"string\"|null },\n      \"_count\": { \"prescriptions\": 0, \"investigations\": 0 },   // literal key \"_count\"; both counts ignore soft-delete\n      \"patientUser\": <see three variants below>\n    }\n  ],\n  \"pagination\": { \"total\": 0, \"page\": 1, \"limit\": 20, \"pages\": 0 }\n}\n\npatientUser has THREE mutually exclusive shapes (asymmetric key sets — must be copied exactly):\n  (a) visit.clinicPatient is non-null  -> { \"displayName\": <clinicPatient.name>, \"phone\": <clinicPatient.phone>|null }   // NO id, NO email\n  (b) app-user visit, User row found    -> { \"id\": \"uuid\", \"displayName\": \"string\", \"email\": \"string\" }                   // NO phone\n  (c) app-user visit, User row missing  -> null\n\nNON-PHYSICIAN branch (PATIENT / RECEPTIONIST / STAFF) — identical object EXCEPT:\n  * these 7 keys are DELETED (absent from JSON, not null): subjective, objective, assessment, plan, rawNotes, rawTranscript, audioUrl\n  * there is NO \"patientUser\" key at all\n  * everything else is retained, INCLUDING specialtyData, diagnosis, diagnosisCodes, sharedSections, patientFeedback, clinic, physician, subprofile, clinicPatient, _count\n{ \"data\": [ { ...as above minus those 7 keys... } ], \"pagination\": {...} }",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header is absent or does not start with 'Bearer '",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws (bad signature, expired, malformed)",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter (100 req/min/IP; Redis store in prod, memory otherwise)",
+        "500 {\"error\":\"Failed to list visits\",\"detail\":\"<raw error.message>\"} on ANY thrown error — notably an invalid ?status value, because req.query.status is passed straight into the Prisma enum filter and Prisma throws PrismaClientValidationError",
+        "200 {\"data\":[],\"pagination\":{\"total\":0,\"page\":<parsed page>,\"limit\":<parsed limit>,\"pages\":0}} — NOT an error: userType==='PHYSICIAN' but no PhysicianProfile row exists; early return before any Visit query"
+      ],
+      "quirks": [
+        "ROUTE ORDER: this is registered at L82, after GET /specialty-template (L32) and GET /specialty-template/:key (L61). Those two must be registered BEFORE GET /:id in the port or they break.",
+        "'detail' is SINGULAR here (\"detail\": error.message) whereas GET /:id uses 'details' PLURAL. Two different key names for the same concept in the same file.",
+        "The 500 body leaks raw error.message unconditionally — it is NOT gated on NODE_ENV (unlike GET /:id, which gates its 'details'). A faithful port must leak it too.",
+        "The 7 SOAP/raw keys for non-physicians are removed by JS destructuring, so they are ABSENT from the JSON. .NET DTOs that emit them as null will break clients that use `'subjective' in visit` or `?.` truthiness checks.",
+        "The non-physician branch ignores sharedSections entirely — SOAP is stripped wholesale on the list route even if the physician shared some sections. Only GET /:id honours sharedSections.",
+        "RECEPTIONIST and STAFF userTypes fall into the else-branch and are filtered by where.patientUserId = their own user id — so receptionists get an empty list, not the clinic's visits. Looks like a bug, is the contract.",
+        "Physician branch: `if (status) where.status = status` else `where.status = { not: 'ARCHIVED' }`. So the code comment 'Physicians never see ARCHIVED visits' is false — ?status=ARCHIVED explicitly returns archived visits.",
+        "parsePagination (server/src/lib/queryHelpers.js): page = Math.max(1, parseInt(page)||1); limit = Math.min(Math.max(1, parseInt(limit)||20), 100); skip=(page-1)*limit. Because of `||`, limit=0 yields 20 (0 is falsy) and page=0 yields 1. limit=-5 yields 1. limit=1000 clamps to 100. limit='50abc' yields 50 (parseInt prefix parse).",
+        "pagination.pages = Math.ceil(total/limit) — 0 when total is 0. On the no-physician-profile early return, pages is the LITERAL 0 (not computed) while page/limit are the parsed values, so ?page=7 returns {total:0,page:7,limit:20,pages:0}.",
+        "clinicId, status, patientUserId, subprofileId are interpolated into the Prisma where with no validation. Express 4's default 'extended' (qs) query parser plus the fact that the global sanitizer at server/src/index.js:79 only cleans req.body (NOT req.query) means ?status[not]=COMPLETED or ?clinicId[in][]=... reach Prisma as filter operator objects. Operator injection on the list filter.",
+        "softDeleteFilter is `{ deletedAt: null }`, spread as the base where — so this route DOES exclude deletedAt rows. GET /:id does NOT. Inconsistent.",
+        "Prisma key order is load-bearing for byte-identical JSON: scalars come out in schema declaration order (id, organizationId, clinicId, physicianId, patientUserId, subprofileId, clinicPatientId, status, audioUrl, rawTranscript, rawNotes, subjective, objective, assessment, plan, chiefComplaint, diagnosis, diagnosisCodes, followUpDate, followUpNotes, sharedSections, patientFeedback, patientFeedbackAt, patientDismissedAt, visitDate, specialtyData, completedAt, createdAt, updatedAt, deletedAt) followed by the relations in include order (clinic, physician, subprofile, clinicPatient, _count), and `patientUser` is APPENDED last by the object spread.",
+        "patientUser for clinicPatient visits is fabricated from the ClinicPatient row and deliberately omits `id` — the client cannot navigate to a user from those rows. For app-user visits it omits `phone`. Do not 'normalize' these two shapes.",
+        "The physician patient-name enrichment is a single batched User.findMany over `[...new Set(...)]` of patientUserIds where `!v.clinicPatient && v.patientUserId` — a deliberate N+1 fix. Ordering of that batch does not affect output (it is turned into a map).",
+        "No caching middleware and no ETag suppression, but server/src/index.js:39 sets app.set('etag','strong'), so Express emits a strong ETag on this JSON and will answer conditional GETs with 304 and an empty body. The .NET port must reproduce ETag/304 or clients that cache will diverge.",
+        "orderBy is visitDate desc only — no tiebreaker, so rows sharing a visitDate have non-deterministic relative order across the two backends."
+      ],
+      "requestQuery": [
+        "clinicId?: string (physician only; raw pass-through to where.clinicId)",
+        "status?: string (raw pass-through to the VisitStatus enum filter; physician only — for non-physicians it is silently ignored and forced to {in:['COMPLETED','ARCHIVED']})",
+        "patientUserId?: string (physician only; read via req.query.patientUserId, NOT destructured)",
+        "subprofileId?: string (physician only; read via req.query.subprofileId)",
+        "page?: number (default 1, min 1)",
+        "limit?: number (default 20, min 1, max 100)"
+      ],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "Clinic (nested select: id, name, specialty)",
+        "PhysicianProfile + User (nested select: physician.id, physician.specialty, physician.user.displayName)",
+        "FamilySubprofile (nested select: id, name, relation)",
+        "ClinicPatient (nested select: id, name, phone)",
+        "User (findMany by id IN — select id, displayName, email)"
+      ],
+      "externalDeps": [
+        "prisma (server/src/lib/prisma)",
+        "logger (server/src/lib/logger, pino)",
+        "queryHelpers.softDeleteFilter / parsePagination"
+      ],
+      "sideEffects": [],
+      "requestBody": []
+    },
+    {
+      "method": "GET",
+      "path": "/:id",
+      "nodeLines": "L272-L370",
+      "summary": "Single visit with clinic, physician(+user), subprofile, and the FULL prescriptions and investigations arrays. Physician-owner gets everything plus isPhysician:true. The patient gets raw clinical input stripped and SOAP sections selectively nulled per visit.sharedSections, plus isPhysician:false. Anyone else gets 403. This route also SHADOWS every later single-segment GET in the router.",
+      "auth": "router.use(authCheck) — JWT Bearer only. In-handler: isPhysician = (PhysicianProfile for req.user.id exists) && visit.physicianId === thatProfile.id; isPatient = visit.patientUserId === req.user.id. Neither -> 403. No auditLog, no cacheMiddleware, no aiUsageCheck.",
+      "successStatus": 200,
+      "responseShape": "PHYSICIAN-OWNER response — `{ ...visit, patientUser, isPhysician }`:\n{\n  // all 30 Visit scalars, schema order, ISO-8601 strings for every DateTime:\n  \"id\": \"uuid\", \"organizationId\": \"uuid\", \"clinicId\": \"uuid\", \"physicianId\": \"uuid\",\n  \"patientUserId\": \"uuid\", \"subprofileId\": \"uuid\"|null, \"clinicPatientId\": \"uuid\"|null,\n  \"status\": \"IN_PROGRESS\"|\"COMPLETED\"|\"CANCELLED\"|\"ARCHIVED\",\n  \"audioUrl\": \"string\"|null, \"rawTranscript\": \"string\"|null, \"rawNotes\": \"string\"|null,\n  \"subjective\": \"string\"|null, \"objective\": \"string\"|null, \"assessment\": \"string\"|null, \"plan\": \"string\"|null,\n  \"chiefComplaint\": \"string\"|null,\n  \"diagnosis\": [\"string\"],                    // never null; [] when empty\n  \"diagnosisCodes\": null|[{\"code\":\"...\",\"description\":\"...\"}],\n  \"followUpDate\": \"ISO\"|null, \"followUpNotes\": \"string\"|null,\n  \"sharedSections\": null|[\"subjective\",\"assessment\",\"plan\"],   // RAW Json? on this branch\n  \"patientFeedback\": \"string\"|null, \"patientFeedbackAt\": \"ISO\"|null,\n  \"patientDismissedAt\": \"ISO\"|null,\n  \"visitDate\": \"ISO\",\n  \"specialtyData\": null|{\"<fieldKey>\":\"string\",\"__templateKey\":\"string\"},\n  \"completedAt\": \"ISO\"|null, \"createdAt\": \"ISO\", \"updatedAt\": \"ISO\",\n  \"deletedAt\": \"ISO\"|null,                    // CAN BE NON-NULL — this route has no soft-delete filter\n\n  \"clinic\":    { \"id\": \"uuid\", \"name\": \"string\", \"specialty\": \"string\"|null, \"phone\": \"string\"|null },\n  \"physician\": { \"id\": \"uuid\", \"specialty\": \"string\", \"licenseNumber\": \"string\",\n                 \"user\": { \"displayName\": \"string\", \"email\": \"string\" } },\n  \"subprofile\": null|{ \"id\": \"uuid\", \"name\": \"string\",\n                       \"relation\": \"SELF\"|\"SPOUSE\"|\"CHILD\"|\"PARENT\"|\"SIBLING\"|\"OTHER\" },\n\n  \"prescriptions\": [                          // full rows, `prescriptions: true`; [] when none, NEVER null\n    { \"id\":\"uuid\", \"visitId\":\"uuid\", \"physicianId\":\"uuid\", \"subprofileId\":\"uuid\"|null,\n      \"status\":\"DRAFT\"|\"SIGNED\"|..., \"medications\": <Json, required — array of {drugName,dosage,...}>,\n      \"notes\":\"string\"|null, \"signedAt\":\"ISO\"|null, \"sentToPatientAt\":\"ISO\"|null, \"pdfUrl\":\"string\"|null,\n      \"refillRequestedAt\":\"ISO\"|null, \"refillStatus\":\"string\"|null, \"refillNotes\":\"string\"|null,\n      \"createdAt\":\"ISO\", \"updatedAt\":\"ISO\", \"deletedAt\":\"ISO\"|null }\n  ],\n  \"investigations\": [                         // full rows, `investigations: true`; [] when none\n    { \"id\":\"uuid\", \"visitId\":\"uuid\", \"subprofileId\":\"uuid\"|null, \"type\":\"string\", \"name\":\"string\",\n      \"instructions\":\"string\"|null,\n      \"status\":\"REQUESTED\"|\"IN_PROGRESS\"|\"COMPLETED\"|\"CANCELLED\",\n      \"resultUrl\":\"string\"|null, \"resultNotes\":\"string\"|null,\n      \"requestedAt\":\"ISO\", \"completedAt\":\"ISO\"|null, \"updatedAt\":\"ISO\" }\n  ],\n\n  \"patientUser\": <see variants>,              // APPENDED after investigations\n  \"isPhysician\": true                         // literal true on this branch, always\n}\n\npatientUser variants on THIS route (different from GET /):\n  (a) visit.clinicPatientId set, ClinicPatient found -> { \"displayName\": <cp.name>, \"email\": <cp.email>|null, \"phone\": <cp.phone>|null }   // key order displayName,email,phone; NO id\n  (b) visit.clinicPatientId set, ClinicPatient gone  -> null\n  (c) no clinicPatientId, User found                 -> { \"displayName\":\"string\", \"email\":\"string\", \"phone\":\"string\"|null }               // NO id — unlike GET /, which DOES send id\n  (d) no clinicPatientId, User gone                  -> null\n\nPATIENT (isPatient && !isPhysician) response — `{ ...safeVisit, patientUser, isPhysician:false, sharedSections: shared }`:\n  Same object EXCEPT:\n  * rawNotes, rawTranscript, audioUrl are DELETED (keys absent, not null)\n  * if visit.sharedSections is an Array: each of subjective/objective/assessment/plan NOT listed in it is set to null (key PRESENT, value null). If it is not an array (null, {}, string) ALL FOUR pass through untouched.\n  * \"sharedSections\" is re-assigned to `Array.isArray(visit.sharedSections) ? visit.sharedSections : null` — so a non-array Json value is reported to the client as null. Because the key already exists on the spread object, JS keeps it at its ORIGINAL schema position; it is not moved to the end.\n  * \"isPhysician\": false, and \"patientUser\" appended.\n  * prescriptions and investigations are returned IN FULL to the patient — no stripping, no sharedSections gating.\n\nDEGRADED-INCLUDE response (see quirks): identical shape but \"investigations\": [] and \"subprofile\": null are assigned by hand AFTER the query, so their key ORDER moves to the end of the object (after prescriptions) instead of their normal positions.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/non-Bearer Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "403 {\"error\":\"Access denied\"} — caller is neither the owning physician nor visit.patientUserId",
+        "404 {\"error\":\"Visit not found\"} — findUnique returned null. This is ALSO what /api/visits/inbox and /api/visits/follow-ups-due return, because they are shadowed by this route.",
+        "404 {\"error\":\"Visit record not found or has been deleted\"} — a thrown Prisma error with code P2025 (different message from the plain 404 above)",
+        "500 {\"error\":\"Database schema mismatch. Please contact support.\"} — thrown Prisma error with code P2021 (table missing) or P2022 (column missing)",
+        "500 {\"error\":\"Failed to get visit\"} in production — the `details` key is set to `undefined` and JSON.stringify DROPS it, so the body has exactly one key",
+        "500 {\"error\":\"Failed to get visit\",\"details\":\"<error.message>\"} when NODE_ENV === 'development' only",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global /api limiter"
+      ],
+      "quirks": [
+        "ROUTE SHADOWING (the biggest one): registered at L272, BEFORE GET /follow-ups-due at L1244. Express 4 `/:id` matches any single path segment, and this handler never calls next(). So GET /api/visits/follow-ups-due and GET /api/visits/inbox are swallowed here and return 404 {\"error\":\"Visit not found\"}. Reproduce or fix deliberately — do not accidentally 'fix' it by reordering unless the client is checked.",
+        "NO soft-delete filter: findUnique({where:{id}}) with no `deletedAt: null` and no status filter. Soft-deleted (deletedAt set) and ARCHIVED visits are fully readable by id. GET / filters them; this does not.",
+        "DEGRADED-INCLUDE FALLBACK: the whole include is wrapped in try/catch. If the rich include throws (deployed DB missing the investigations table / subprofile relation), it logs a warning and re-queries with only clinic+physician+prescriptions, then sets visit.investigations = [] and visit.subprofile = null. Net effect: a schema problem silently degrades to a 200 with empty investigations rather than an error — and the JSON key ORDER changes (investigations and subprofile move to the tail).",
+        "`details` is PLURAL here and NODE_ENV-gated; GET / uses `detail` SINGULAR and always leaks. Both must be copied verbatim.",
+        "In production the 500 body is {\"error\":\"Failed to get visit\"} with NO second key — because `details: undefined` is dropped by JSON.stringify, not emitted as null. A .NET DTO with a nullable Details property will emit \"details\":null and break byte-identity.",
+        "isPhysician is computed as `physician && visit.physicianId === physician.id`, which is `null` when no PhysicianProfile exists. But that path always routes into the patient branch (or 403), so the final `res.json` branch always emits the literal boolean true. The patient branch emits the literal boolean false. isPhysician is never null on the wire.",
+        "patientUser omits `id` on BOTH branches of this route, while GET / includes `id` in its app-user variant. Same logical field, three different key sets across two endpoints.",
+        "ClinicPatient-backed visits: patientUser is synthesized as {displayName: cp.name, email, phone} — `name` is RENAMED to `displayName`. There is no `name` key on the wire.",
+        "A visit created from a ClinicPatient with no linkedUserId stores the PHYSICIAN's own userId as patientUserId (see POST / at L215: `resolvedPatientUserId = cp?.linkedUserId || userId`). For such visits the physician satisfies BOTH isPhysician and isPatient; isPhysician wins because the patient branch is guarded by `isPatient && !isPhysician`. Order of that check is load-bearing.",
+        "sharedSections === [] (an empty array) IS an array, so it nulls ALL FOUR SOAP sections for the patient. PUT /:id/complete normalizes empty to null, but any row that got [] another way is fully hidden. Do not treat [] as 'share all'.",
+        "sharedSections gating applies ONLY to the four SOAP text fields. specialtyData, diagnosis, diagnosisCodes, chiefComplaint, followUpNotes, prescriptions and investigations are always fully visible to the patient regardless of sharedSections.",
+        "Clinic staff / receptionists have NO access to this endpoint at all — 403 even for visits in a clinic they staff. Only the owning physician and the patient.",
+        "Soft-deleted prescriptions are included: `prescriptions: true` has no `where: { deletedAt: null }`, so rows with deletedAt set appear in the array with a non-null deletedAt.",
+        "prescriptions and investigations are unordered (no orderBy) — Postgres returns them in arbitrary order. SQL Server will differ. If the client renders them in list order, add an explicit orderBy and accept the divergence, or leave unordered and note it.",
+        "prescriptions[].medications is a required Json column — it is whatever the writer stored (normally an array of objects) and is never null, but it is not schema-validated.",
+        "app.set('etag','strong') at server/src/index.js:39 means this response carries a strong ETag and can answer 304 with an empty body.",
+        "No cacheMiddleware here — every call hits the DB, and every call also issues a second PhysicianProfile lookup and a third ClinicPatient-or-User lookup: 3 round trips minimum, 4 with the include. The `.catch(() => null)` on the PhysicianProfile lookup swallows DB errors into 'not a physician', which can turn a transient DB fault into a 403 rather than a 500."
+      ],
+      "requestQuery": [],
+      "dbWrites": [],
+      "crossModelReads": [
+        "Clinic (nested select: id, name, specialty, phone)",
+        "PhysicianProfile + User (nested select: id, specialty, licenseNumber, user.displayName, user.email)",
+        "FamilySubprofile (nested select: id, name, relation)",
+        "PhysicianProfile (second findUnique by userId, for the access check; errors swallowed to null)",
+        "ClinicPatient (findUnique by id — select name, phone, email)",
+        "User (findUnique by patientUserId — select displayName, email, phone)"
+      ],
+      "externalDeps": [
+        "prisma (server/src/lib/prisma)",
+        "logger (server/src/lib/logger)"
+      ],
+      "sideEffects": [],
+      "requestBody": []
+    },
+    {
+      "method": "GET",
+      "path": "/patient/:patientUserId",
+      "nodeLines": "NOT PRESENT — no such route exists anywhere in server/src/routes/visits.js (see the full route inventory at L21, L32, L61, L82, L182, L272, L391, L488, L611, L674, L964, L1023, L1129, L1168, L1211, L1244, L1342, L1379, L1419)",
+      "summary": "DEAD CLIENT CALL. The React client requests it at D:/Programming/Tebrazi/TEBRAZI/TEBRAZI/client/src/components/PatientTimeline.jsx:26 (`api.get('/visits/patient/' + patient.id)`), but the router defines no matching handler. Because the path has TWO segments it does not even match GET /:id, so it escapes the router entirely and lands on the app-level catch-all 404 at server/src/index.js:303. The client's `.catch(() => setVisits([]))` swallows it, so the Patient Timeline panel silently renders as empty forever.",
+      "auth": "router.use(authCheck) at L21 DOES run (router.use matches every path entering the mount), so an unauthenticated request is rejected with 401 before the 404. An authenticated request passes authCheck, then finds no route and falls through to the global 404 handler.",
+      "successStatus": 404,
+      "responseShape": "There is no success response. The only body ever produced is the global catch-all at server/src/index.js:303-308:\n{\n  \"error\": \"Not Found\",\n  \"message\": \"Route GET /api/visits/patient/<patientUserId> not found\"\n}\nHTTP 404. Note `req.path` is interpolated verbatim, so the caller's raw id is reflected back in the message string.\n\nIf the port is meant to IMPLEMENT this endpoint (the client clearly expects a per-patient visit timeline), note that the existing equivalent is already reachable as GET /api/visits?patientUserId=<id>, which returns the {data, pagination} envelope described for GET /. The client here does `r.data || []` and treats the payload as a bare ARRAY — so a naive implementation returning the paginated envelope would set visits to an object and break the component's .map(). A faithful new endpoint must return a BARE ARRAY, not {data, pagination}.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — authCheck fires first, before the 404",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "404 {\"error\":\"Not Found\",\"message\":\"Route GET /api/visits/patient/<id> not found\"} — the actual, only outcome for an authenticated caller",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global /api limiter still applies"
+      ],
+      "quirks": [
+        "The endpoint named in the port spec DOES NOT EXIST in the Node backend. Porting it as a working endpoint is a BEHAVIOR CHANGE, not a port. Confirm intent before implementing.",
+        "Ordering matters for the 401-vs-404 distinction: router.use(authCheck) is path-agnostic, so unauthenticated calls to a nonexistent sub-path get 401, not 404. A .NET port that resolves routes before running auth will emit 404 where Node emits 401.",
+        "The 404 message string embeds req.path unescaped — an id containing weird characters is echoed into the JSON body. It is a JSON string so it is escaped by the serializer, but the value is attacker-controlled reflection.",
+        "In production (server/src/index.js:295-299) a static-file middleware plus `app.get(/^(?!\\/api).*$/, ...)` SPA fallback is registered BEFORE the 404 handler — but the negative lookahead excludes /api paths, so /api/visits/patient/x still reaches the JSON 404 rather than index.html. Verify the port keeps API 404s as JSON, not an HTML shell.",
+        "The client at PatientTimeline.jsx:26 expects a bare array (`r.data || []`, then `.map`), NOT the {data, pagination} envelope the rest of this router uses. Whatever the port does here, that array-vs-envelope mismatch is the live decision."
+      ],
+      "requestQuery": [],
+      "dbWrites": [],
+      "crossModelReads": [],
+      "externalDeps": [
+        "server/src/index.js global 404 handler (L303)",
+        "authCheck (server/src/middleware/auth.js)"
+      ],
+      "sideEffects": [],
+      "requestBody": []
+    },
+    {
+      "method": "GET",
+      "path": "/inbox",
+      "nodeLines": "NOT PRESENT as its own route — resolved by GET /:id at L272-L370 with req.params.id === 'inbox'",
+      "summary": "DEAD CLIENT CALL, SHADOWED. The client requests it at D:/Programming/Tebrazi/TEBRAZI/TEBRAZI/client/src/pages/ConnectionsPage.jsx:214 (`api.get('/visits/inbox')`) to build a last-visit-per-doctor map. No /inbox handler exists. Being a single segment, it matches GET /:id, which does prisma.visit.findUnique({where:{id:'inbox'}}). Visit.id is a Postgres TEXT column (String @id @default(uuid())) so there is no cast error — the query simply returns null and the handler responds 404 {\"error\":\"Visit not found\"}. The client's .catch(() => {}) swallows it, so lastVisitMap stays empty and no last-visit dates ever render on the Connections page.",
+      "auth": "router.use(authCheck) runs, then the GET /:id handler runs. The 404 fires BEFORE the access check, so any authenticated user of any userType gets the same 404 — no 401/403 distinction beyond the token check.",
+      "successStatus": 404,
+      "responseShape": "No success response is reachable. The only body is the GET /:id not-found branch (L385):\n{ \"error\": \"Visit not found\" }\nHTTP 404.\n\nEdge case worth knowing: if a Visit row ever existed whose primary key literally equalled the string \"inbox\", GET /api/visits/inbox would return that visit's full detail payload (the GET /:id shape) to whoever satisfied the physician/patient check. Visit.id is unvalidated TEXT, so this is possible if any writer supplies its own id.\n\nIf the port is meant to IMPLEMENT this endpoint: the client at ConnectionsPage.jsx:214 iterates `(r.data || []).forEach(v => { const docId = v.physicianUserId || v.physician?.userId; if (docId && !map[docId]) map[docId] = v.visitDate; })`. So it expects a BARE ARRAY of visits, newest first, where each element exposes EITHER a flat \"physicianUserId\" key (which does NOT exist on the Visit model — it would have to be projected) OR a nested \"physician\": { \"userId\": \"uuid\" } (the GET / include selects physician.id/specialty/user.displayName and does NOT select userId, so the existing include would not satisfy this either), plus \"visitDate\". Neither shape is produced by any current route — the client was written against an endpoint that was never built.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/non-Bearer Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "404 {\"error\":\"Visit not found\"} — the actual, only outcome; produced by the GET /:id handler, not by a 404 route",
+        "500 {\"error\":\"Database schema mismatch. Please contact support.\"} — if the shared /:id findUnique throws P2021/P2022",
+        "500 {\"error\":\"Failed to get visit\"} — any other throw inside the /:id handler (production; `details` added only when NODE_ENV==='development')",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global /api limiter"
+      ],
+      "quirks": [
+        "The endpoint DOES NOT EXIST. Its 404 comes from a completely different handler (GET /:id) and therefore carries the message \"Visit not found\" rather than the global \"Not Found\"/\"Route ... not found\" pair. A .NET port that returns a conventional route-not-found 404 body here changes the bytes.",
+        "This is the concrete proof that GET /:id at L272 shadows every later single-segment GET in the file — the same mechanism that kills /follow-ups-due at L1244.",
+        "404-before-403: the GET /:id handler does findUnique and returns 404 BEFORE resolving the caller's PhysicianProfile, so the not-found path costs exactly one query and never reveals authorization state.",
+        "Visit.id is unvalidated TEXT (Prisma String @id over Postgres TEXT). Non-UUID ids produce a clean null, NOT a database cast error. On SQL Server, if the port types the visit PK as UNIQUEIDENTIFIER, GET /api/visits/inbox (and any non-GUID id) will throw a conversion error and become a 500 instead of Node's 404. This is a real, easy-to-hit port regression — keep the PK as a string/nvarchar or guard the parse.",
+        "The client swallows the failure (`.catch(() => {})`), so this has been broken silently in production. Fixing it in .NET would visibly CHANGE the Connections page, which is a product decision, not a port decision.",
+        "The shape the client wants (flat `physicianUserId`, or `physician.userId`) is projected by NO existing route — GET /'s physician include selects id/specialty/user.displayName only. Any implementation has to add userId to the projection."
+      ],
+      "requestQuery": [],
+      "dbWrites": [],
+      "crossModelReads": [
+        "Visit (findUnique with the full GET /:id include — Clinic, PhysicianProfile+User, FamilySubprofile, Prescription, Investigation); returns null for id='inbox' so no further reads occur"
+      ],
+      "externalDeps": [
+        "prisma (server/src/lib/prisma)",
+        "logger (server/src/lib/logger)"
+      ],
+      "sideEffects": [],
+      "requestBody": []
+    },
+    {
+      "method": "GET",
+      "path": "/follow-ups-due",
+      "nodeLines": "L1244-L1327 (handler defined) — but UNREACHABLE: shadowed by GET /:id at L272",
+      "summary": "Physician dashboard follow-up queue. Intended to return up to 20 COMPLETED visits whose followUpDate is <= 7 days out (with NO lower bound, so all historical overdue rows), each flattened to an 11-key row with a derived patientName and an OVERDUE/TODAY/UPCOMING urgency, AND to fire FOLLOW_UP_REMINDER notifications for overdue patients as a side effect of the GET. In reality the handler is dead code: GET /:id at L272 matches '/follow-ups-due' first and never calls next(), so the request 404s with {\"error\":\"Visit not found\"}. The client (client/src/pages/PhysicianDashboardPage.jsx:59) fetches it inside Promise.allSettled and only assigns on 'fulfilled', so the dashboard's follow-up panel is permanently empty and the reminder notifications never send.",
+      "auth": "router.use(authCheck) + cacheMiddleware(30). No auditLog, no aiUsageCheck. Ownership is implicit: physicianId is taken from the caller's own PhysicianProfile; a caller with no PhysicianProfile gets an empty array (200), never a 403. Non-physician userTypes are NOT rejected — they just get []. (All moot while shadowed.)",
+      "successStatus": 200,
+      "responseShape": "ACTUAL behavior today (shadowed by GET /:id): HTTP 404, body { \"error\": \"Visit not found\" }.\n\nINTENDED shape if the route is registered before GET /:id — a BARE ARRAY (no envelope), orderBy followUpDate asc, take 20:\n[\n  {\n    \"id\": \"uuid\",                       // Visit.id\n    \"patientName\": \"string\",            // ALWAYS a non-empty string; derived, never null. clinicPatient.name -> else User.displayName -> else the literal \"Patient\"\n    \"patientUserId\": \"uuid\",\n    \"subprofileName\": \"string\",         // KEY IS OMITTED ENTIRELY when subprofile is null (v.subprofile?.name is undefined and JSON.stringify drops it) — NOT null\n    \"chiefComplaint\": \"string\"|null,\n    \"followUpDate\": \"2026-09-10T00:00:00.000Z\",   // ISO-8601 Date; non-null because the `lte` filter excludes NULLs\n    \"followUpNotes\": \"string\"|null,\n    \"visitDate\": \"2026-09-01T08:12:44.031Z\",      // ISO-8601 Date, non-null\n    \"isOverdue\": true|false,            // real boolean\n    \"isToday\": true|false,              // real boolean\n    \"urgency\": \"OVERDUE\"|\"TODAY\"|\"UPCOMING\"\n  }\n]\nExactly these 11 keys in exactly this order (10 when subprofileName is dropped). NOTHING else — no clinic, no status, no SOAP, no subprofile object, no clinicPatient object, even though subprofile{name} and clinicPatient{name} ARE selected by the Prisma include and then discarded by the map.\n\nEmpty-array cases (both are 200 with the literal `[]`, never null):\n  * caller has no PhysicianProfile row -> `return res.json([])` at L1248, before any Visit query\n  * no matching visits -> `[]` from the map",
+      "errorCases": [
+        "404 {\"error\":\"Visit not found\"} — THE ACTUAL RESPONSE TODAY, emitted by GET /:id (L385) because this route is shadowed. Nothing in the handler below ever runs.",
+        "401 {\"error\":\"No token provided\"} — missing/non-Bearer Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "500 {\"error\":\"Failed to load follow-ups\"} — the handler's own catch-all, if it were reachable (single key, no detail, no NODE_ENV gate)",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global /api limiter",
+        "200 [] — caller has no PhysicianProfile (not an error; early return)"
+      ],
+      "quirks": [
+        "UNREACHABLE DEAD CODE. Registered at L1244, long after GET /:id at L272. Express 4 matches in registration order and the /:id handler never calls next(), so /api/visits/follow-ups-due returns 404 {\"error\":\"Visit not found\"}. If the port registers it correctly, the physician dashboard's follow-up panel and the FOLLOW_UP_REMINDER notification stream both come alive for the first time — a visible product change plus a burst of backdated reminder emails/notifications on first call. Flag this before shipping.",
+        "GET WITH WRITES. A plain GET creates Notification rows (and dispatches push) for every overdue visit. Non-idempotent read. Any .NET port must decide whether to keep this; if kept, note it is NOT in a transaction — each createNotification is its own insert, and a mid-loop failure leaves partial reminders sent with no rollback (and the whole request then 500s via the outer catch, after having already written some rows).",
+        "NO LOWER BOUND on followUpDate: the filter is only `{ lte: weekAhead }`. Every overdue follow-up ever recorded is eligible, going back indefinitely. Combined with `take: 20` and `orderBy: followUpDate asc`, the response is dominated by the OLDEST overdue rows — the 'next 7 days' upcoming items described in the doc comment are pushed off the end and never shown once 20+ stale overdue rows exist. Faithful port must copy this.",
+        "take: 20 with NO skip and no pagination — hard cap, silently truncated, no total count.",
+        "NULL followUpDate rows are excluded implicitly: Prisma `lte` on a nullable column becomes `followUpDate <= x`, and SQL NULL comparisons are never true. Do NOT add an explicit IS NOT NULL that changes anything, but be aware the .NET LINQ equivalent must behave the same.",
+        "NO soft-delete filter — no `deletedAt: null`. Rows with deletedAt set are included if status is still COMPLETED. (Note the router's own DELETE /:id at L1342 soft-deletes by setting status='ARCHIVED', not deletedAt, so ARCHIVED rows ARE excluded by the status filter — but anything that sets deletedAt directly is not.)",
+        "subprofileName uses optional chaining and is `undefined` when there is no subprofile, so the KEY VANISHES from the JSON. A .NET DTO must omit the property (JsonIgnoreCondition.WhenWritingNull is not enough if the property would serialize as null — the Node output has no key at all).",
+        "N+1 QUERY: `Promise.all(visits.map(async v => { ... await prisma.user.findUnique(...) }))` issues one User lookup per row that has no clinicPatient — up to 20 sequential-ish round trips. Unlike GET /, this was never batched.",
+        "patientName resolution order is clinicPatient.name FIRST, then User.displayName, then the literal string \"Patient\". Note it checks `v.clinicPatient?.name` (truthiness), so a ClinicPatient with an empty-string name falls through to the User lookup.",
+        "DAY BOUNDARIES ARE SERVER-LOCAL, NOT UTC: `today = new Date(now.getFullYear(), now.getMonth(), now.getDate())` builds local midnight, and `weekAhead` is local midnight + 7 days. isToday compares `new Date(v.followUpDate).toDateString() === today.toDateString()` — local calendar-day string equality. A .NET port using DateTime.UtcNow.Date will classify rows differently for any server not on UTC, and will shift the `lte weekAhead` cutoff by the offset. Match the server TZ or replicate local-midnight math exactly.",
+        "isOverdue is `v.followUpDate && new Date(v.followUpDate) < today` — strictly BEFORE local midnight today. So a followUpDate earlier today (e.g. 09:00 today when it is now 14:00) is NOT overdue; it is TODAY. urgency is a plain ternary chain: OVERDUE wins over TODAY wins over UPCOMING, and OVERDUE/TODAY are mutually exclusive by construction.",
+        "weekAhead is exactly local midnight on day+7, and the filter is `lte`, so a followUpDate of exactly 00:00:00.000 on day 7 is INCLUDED while 00:00:00.001 on day 7 is excluded. Off-by-one boundary worth a test.",
+        "cacheMiddleware(30) (server/src/lib/cacheMiddleware.js) wraps this: cache key is `route:${req.user?.id || 'anon'}:${req.originalUrl}` — per-user AND per-query-string, TTL 30s, and it monkey-patches res.json so only 2xx bodies are cached. A cache HIT returns the memoized array and SKIPS THE ENTIRE HANDLER — so the FOLLOW_UP_REMINDER side effect fires at most once per 30 seconds per user, and the 'once per day' notification guard is really 'once per day, and at most once per 30s window'. Any .NET port must decide whether cached responses also skip the writes.",
+        "The duplicate-reminder guard is a Prisma JSON-path query: `prisma.notification.findFirst({ where: { userId, type:'FOLLOW_UP_REMINDER', data: { path: ['visitId'], equals: visit.id }, createdAt: { gte: today } } })`. On SQL Server this needs JSON_VALUE(data, '$.visitId') = @visitId; there is no index for it, so it is a scan per overdue row. `createdAt: { gte: today }` is again LOCAL midnight.",
+        "Reminder notifications are created with sendEmail:false AND sendPush:false — but createNotification (server/src/services/notificationService.js:36) still attempts push dispatch unconditionally in a separate try block regardless of the sendPush flag ('Push dispatch — always attempt when push tokens exist'). So sendPush:false does NOT actually suppress push. Copy that or you change notification volume.",
+        "The reminder message interpolates chiefComplaint into a quoted string with a fallback: `Your follow-up appointment for \"${visit.chiefComplaint || 'your visit'}\" is overdue. Please contact your doctor to schedule.` — the literal double quotes are part of the message body.",
+        "The reminder is sent to visit.patientUserId. For ClinicPatient-backed visits created without a linkedUserId, patientUserId is the PHYSICIAN's own userId (POST / at L215), so overdue reminders for walk-in charts are delivered to the doctor about their own 'visit'. Existing behavior.",
+        "The include selects subprofile{name} and clinicPatient{name} and then throws both objects away in the map — the port should still fetch them (they feed patientName/subprofileName) but must not emit them.",
+        "No tiebreaker on `orderBy: { followUpDate: 'asc' }` — rows sharing a followUpDate (very common, since follow-ups are date-only at midnight) come back in arbitrary order, and Postgres vs SQL Server will differ. If the client's rendering order matters, this needs an explicit secondary sort and the divergence acknowledged."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "notifications — INSERT one row per overdue visit that has no same-day FOLLOW_UP_REMINDER (via createNotification). NOT in a transaction; each insert is independent, so partial writes survive a mid-loop failure."
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "FamilySubprofile (nested select: name — discarded except for subprofileName)",
+        "ClinicPatient (nested select: name — discarded except for patientName)",
+        "User (findUnique per row, select displayName — N+1)",
+        "Notification (findFirst per overdue row, JSON-path filter on data.visitId + createdAt >= local midnight)",
+        "PushToken / User email (read inside notificationService during dispatch)"
+      ],
+      "externalDeps": [
+        "prisma (server/src/lib/prisma)",
+        "logger (server/src/lib/logger)",
+        "cacheMiddleware (server/src/lib/cacheMiddleware) — 30s per-user in-memory response cache backed by server/src/lib/cache",
+        "notificationService.createNotification (server/src/services/notificationService.js:36) — lazily required INSIDE the handler",
+        "emailService.sendEmail + push dispatch, reached transitively through createNotification"
+      ],
+      "sideEffects": [
+        "Creates FOLLOW_UP_REMINDER Notification rows for overdue visits, deduped to once per patient+visit per local calendar day",
+        "Attempts push notification delivery even though sendPush:false is passed (notificationService always tries push when tokens exist)",
+        "Populates the 30s per-user response cache under key route:<userId>:<originalUrl>, which suppresses the notification side effect on subsequent calls inside the window",
+        "No email: sendEmail:false is honored by createNotification's email branch"
+      ],
+      "requestBody": []
+    }
+  ]
+}

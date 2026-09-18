@@ -1,0 +1,382 @@
+{
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/:id/refill-request",
+      "nodeLines": "L526-L577",
+      "summary": "Patient requests a refill on one of their own prescriptions. Flips refillStatus to PENDING, stamps refillRequestedAt, overwrites refillNotes with the supplied notes (or null), and fires a REFILL_REQUEST notification to the prescribing physician. Responds with only two fields — NOT the full prescription.",
+      "auth": "router.use(authCheck) at L20 (JWT Bearer -> req.user {id, userType, ...}). No auditLog, no aiUsageCheck. In-handler gate: prescription.visit.patientUserId must === req.user.id (patient-only; the prescribing physician gets 403 here). No userType check — any user who is the visit's patient passes, regardless of userType claim.",
+      "successStatus": 200,
+      "responseShape": "{ \"refillStatus\": \"PENDING\", \"refillRequestedAt\": \"2026-09-03T10:22:33.123Z\" }  // exactly 2 keys. refillStatus is always the literal string \"PENDING\" (it is what was just written). refillRequestedAt is a DateTime serialized by JSON as an ISO-8601 string with milliseconds and trailing Z. No id, no medications, no message key.",
+      "requestBody": [
+        "notes?: string (optional; any other body keys are ignored). Body may be entirely empty ({}) — that is what both client callers send (PrescriptionPanel.jsx L228, PrescriptionsPage.jsx L254)."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "prescriptions: UPDATE refillRequestedAt=now(), refillStatus='PENDING', refillNotes=notes||null (no transaction)",
+        "notifications: INSERT (userId=physician.userId, type='REFILL_REQUEST') — inside try/catch, best-effort",
+        "ai/email/push: no DB write; push tokens read by pushService"
+      ],
+      "crossModelReads": [
+        "User (patient displayName for the notification message)",
+        "PhysicianProfile (by prescription.physicianId, select userId)",
+        "Notification (created via notificationService)"
+      ],
+      "externalDeps": [
+        "notificationService.createNotification (lazily required inside the handler)",
+        "emailService — NOT invoked here (sendEmail:false)",
+        "pushService.send — always attempted by createNotification, best-effort"
+      ],
+      "sideEffects": [
+        "Notification row for the physician: type 'REFILL_REQUEST', title 'Prescription Refill Request', message `${patient.displayName || 'A patient'} requested a prescription refill.`, data { prescriptionId: id }",
+        "Web push attempt to the physician (title/body = the notification title/message)",
+        "No email (sendEmail: false)",
+        "No cache invalidation — GET /api/prescriptions is cached 15s per-user and GET /summary 30s, so the requesting patient's own list can still show the pre-refill state for up to 15s"
+      ],
+      "errorCases": [
+        "404 {\"error\":\"Prescription not found\"} when no Prescription row with that id (note: the model has deletedAt but findUnique does NOT filter it, so soft-deleted prescriptions are still refillable)",
+        "403 {\"error\":\"Not your prescription\"} when prescription.visit.patientUserId !== req.user.id",
+        "400 {\"error\":\"Can only request refill on sent/dispensed prescriptions\"} when status is not one of SENT, DISPENSED, CONFIRMED (note: message says sent/dispensed but CONFIRMED is also allowed; DRAFT and SIGNED are rejected)",
+        "400 {\"error\":\"Refill request already pending\"} when prescription.refillStatus === 'PENDING'",
+        "500 {\"error\":\"Failed to request refill\"} on any thrown error",
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter (100 req/min/IP)"
+      ],
+      "quirks": [
+        "Response is a 2-key projection, not the prescription. A port that returns the updated row breaks nothing visibly today (clients ignore the body and refetch) but violates byte-identity.",
+        "refillNotes is ALWAYS overwritten: `refillNotes: notes || null`. Re-requesting after an APPROVED/DENIED decision silently WIPES the physician's previous refillNotes to null. An empty-string notes also writes null.",
+        "Status gate allows CONFIRMED even though the error message only mentions sent/dispensed. Order of the allowed list in code is ['SENT','DISPENSED','CONFIRMED'].",
+        "refillStatus is a plain String column (not an enum) in Prisma — values are the bare strings 'PENDING'/'APPROVED'/'DENIED', and NULL for never-requested. A .NET port must NOT model it as a non-nullable enum.",
+        "Only refillStatus === 'PENDING' blocks; APPROVED or DENIED lets the patient immediately re-request, resetting to PENDING.",
+        "No status transition guard beyond the above — a prescription can be refill-requested repeatedly after each decision.",
+        "The notification block is wrapped in try/catch; if PhysicianProfile lookup returns null NO notification is created and the request still returns 200.",
+        "The global XSS sanitizer (index.js L57-L81) mutates req.body BEFORE the handler: `notes` has HTML tags/on*= handlers stripped, `javascript:`/`data:`/`vbscript:` prefixes removed, and every `url(` rewritten to `url\\(`. The stored refillNotes is the sanitized string, not the raw client string. A .NET port must reproduce this or stored values differ.",
+        "No deletedAt filter anywhere in this file.",
+        "Route ordering: PUT /:id (L242) does not shadow these two-segment routes; POST / (L99) does not shadow /check-interactions or /transcribe-rx. No shadowing affects any of the 7 endpoints."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/refill-respond",
+      "nodeLines": "L585-L637",
+      "summary": "Prescribing physician approves or denies a pending refill. Writes refillStatus = the action string and conditionally updates refillNotes, then emails+notifies the patient. Returns a 2-key projection.",
+      "auth": "authCheck (router-level). No auditLog, no aiUsageCheck. In-handler gate: PhysicianProfile must exist for req.user.id AND prescription.physicianId === physician.id. Patients always get 403.",
+      "successStatus": 200,
+      "responseShape": "{ \"refillStatus\": \"APPROVED\", \"refillNotes\": \"Refill ok for 30 days\" }  // exactly 2 keys. refillStatus is the literal action string sent by the caller ('APPROVED' or 'DENIED'). refillNotes is a nullable string — null when neither the request nor the prior row had notes. No id, no message, no timestamps.",
+      "requestBody": [
+        "action: string, REQUIRED, must be exactly 'APPROVED' or 'DENIED' (case-sensitive, uppercase)",
+        "notes?: string (optional physician note)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "prescriptions: UPDATE refillStatus=action, refillNotes=(notes || existing refillNotes) (no transaction)",
+        "notifications: INSERT for the patient — best-effort inside try/catch"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (ownership check by userId)",
+        "Notification (via notificationService)",
+        "User (read inside createNotification for the email address)"
+      ],
+      "externalDeps": [
+        "notificationService.createNotification (lazily required)",
+        "emailService.sendEmail (sendEmail: true -> real email dispatched)",
+        "pushService.send (best-effort)"
+      ],
+      "sideEffects": [
+        "Notification for prescription.visit.patientUserId: type 'REFILL_RESPONSE', title `Refill Approved` or `Refill Denied`, message `Your prescription refill request has been approved.` / `...denied.` with `` ` Note: ${notes}` `` appended only when notes is truthy",
+        "EMAIL sent to the patient (sendEmail: true): subject = the title, html = `<h2>${title}</h2><p>${message}</p>`, text = `${title}\\n\\n${message}`",
+        "Web push attempt",
+        "No cache invalidation of the 15s/30s GET caches"
+      ],
+      "errorCases": [
+        "400 {\"error\":\"Action must be APPROVED or DENIED\"} when action is not exactly 'APPROVED' or 'DENIED' — this check runs FIRST, before the prescription is even loaded, so a bad action on a nonexistent id returns 400, not 404",
+        "404 {\"error\":\"Prescription not found\"}",
+        "403 {\"error\":\"Not your prescription\"} when the caller has no PhysicianProfile or is not the prescriber",
+        "400 {\"error\":\"No pending refill request\"} when prescription.refillStatus !== 'PENDING' (including null)",
+        "500 {\"error\":\"Failed to respond to refill\"}",
+        "401 from authCheck; 429 from the global limiter"
+      ],
+      "quirks": [
+        "Validation order matters for byte-identity: action validation precedes the 404/403 checks.",
+        "`action` is written verbatim into the refillStatus String column — a port must store the raw uppercase string, not an enum ordinal.",
+        "refillNotes uses `notes || prescription.refillNotes` — an empty string or omitted notes PRESERVES the previous value (opposite of refill-request, which nulls it). The two endpoints treat refillNotes inconsistently.",
+        "The notification title uses a ternary on APPROVED, so DENIED (and only DENIED, since other values are rejected) yields 'Refill Denied'.",
+        "The message embeds `action.toLowerCase()` -> 'approved'/'denied'.",
+        "Note suffix is `' Note: ' + notes` — a single leading space after the period, no comma. Byte-exact for the email/notification body.",
+        "refillRequestedAt is NOT cleared on response — it keeps the original request timestamp.",
+        "This endpoint sends a real email; the refill-request endpoint deliberately does not (sendEmail:false there, true here).",
+        "No transaction: if the Notification insert fails the prescription update still stands (caught and logged).",
+        "Global XSS sanitizer rewrites `notes` before it is stored and before it is interpolated into the email HTML."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/stop-medication",
+      "nodeLines": "L646-L686",
+      "summary": "Patient marks one medication inside the prescription's medications JSON array as stopped by adding stoppedAt + stoppedByPatient to that element. Returns a message and the FULL in-memory medications array (not the DB row).",
+      "auth": "authCheck (router-level). No auditLog, no aiUsageCheck, no status gate. In-handler gate: prescription.visit.patientUserId === req.user.id (patient-only; the prescribing physician gets 403).",
+      "successStatus": 200,
+      "responseShape": "{ \"message\": \"Stopped Amoxicillin\", \"medications\": [ { \"drugName\": \"Amoxicillin\", \"dosage\": \"500mg\", \"frequency\": \"Three times daily\", \"duration\": \"7 days\", \"instructions\": \"\", \"stoppedAt\": \"2026-09-03T10:22:33.123Z\", \"stoppedByPatient\": true }, { ...untouched original elements, passed through verbatim... } ] }  // 2 keys. `medications` is the whole array, not just the changed element. Element keys are whatever the stored JSON had (typically drugName/dosage/frequency/duration/instructions as written by POST / or by the AI extractors) PLUS the two stop flags on the targeted index only. stoppedAt is a STRING (new Date().toISOString()), not a Date — it is generated with .toISOString() in the handler, so it is a string both in the response and in the persisted JSON column. The array is [] (empty array, never null) when the stored medications value was not an array.",
+      "requestBody": [
+        "medicationIndex: REQUIRED (rejected only when undefined or null). Declared as a number; no typeof check is performed."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "prescriptions: UPDATE medications = <the whole rebuilt array> (whole-column JSON overwrite, no transaction)"
+      ],
+      "crossModelReads": [],
+      "externalDeps": [],
+      "sideEffects": [
+        "None — no notification, no email, no push, no audit row.",
+        "No reminder cleanup: the DAILY medication Reminder rows auto-created by PUT /:id/send are NOT cancelled or deleted when a medication is stopped. The patient keeps receiving reminders for a stopped drug.",
+        "No cache invalidation."
+      ],
+      "errorCases": [
+        "400 {\"error\":\"medicationIndex is required\"} ONLY when medicationIndex === undefined || === null (0 passes correctly; '' , false and NaN all pass this check)",
+        "404 {\"error\":\"Prescription not found\"}",
+        "403 {\"error\":\"Not your prescription\"} when the caller is not the visit's patient",
+        "400 {\"error\":\"Invalid medication index\"} when medicationIndex < 0 or >= meds.length — meds is [] when the stored medications JSON is not an array, so every index is then invalid",
+        "500 {\"error\":\"Failed to stop medication\"}",
+        "401 from authCheck; 429 from the global limiter"
+      ],
+      "quirks": [
+        "Returns the in-memory `meds` array, NOT the prisma update result. A port must echo the array it just built, and must include untouched elements verbatim (all original keys, in original key order).",
+        "stoppedAt is a string-formatted ISO-8601 date (new Date().toISOString()), not a Date/DateTime. In SQL Server this must stay a string inside the JSON column — do not round-trip it through DateTime formatting that drops milliseconds or the Z.",
+        "stoppedByPatient is the literal boolean true.",
+        "The element is REPLACED with a spread copy: `{...meds[i], stoppedAt, stoppedByPatient}`. Original key order is preserved and the two new keys are appended last. Byte-identical JSON requires the same key ordering.",
+        "NaN index bypass: a non-numeric medicationIndex (e.g. \"abc\") passes both bounds checks (NaN comparisons are false), so `meds[\"abc\"] = {...undefined, stoppedAt, stoppedByPatient}` sets a NON-INDEX property on the array. JSON.stringify drops it, so the DB write is a no-op, and the response is 200 with message \"Stopped undefined\" and an unchanged medications array. A faithful port must reproduce this 200 + \"Stopped undefined\" behavior, not 400.",
+        "String indices work by numeric coercion: medicationIndex \"1\" passes the bounds checks and meds[\"1\"] resolves the array element.",
+        "message is a template literal: `Stopped ${meds[medicationIndex].drugName}` — if the element has no drugName the message reads \"Stopped undefined\" (still 200).",
+        "No status gate at all: a patient can stop a medication on a DRAFT or SIGNED (never-sent) prescription, as long as it is on their visit.",
+        "No deletedAt filter — soft-deleted prescriptions are still mutable here.",
+        "Stopped medications are excluded from cross-prescription drug interaction checks (check-interactions filters on !m.stoppedAt), so this write silently changes that endpoint's result.",
+        "Whole-array overwrite means concurrent stop/resume calls last-write-wins with no optimistic concurrency."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/resume-medication",
+      "nodeLines": "L694-L729",
+      "summary": "Patient un-stops a medication by destructuring stoppedAt and stoppedByPatient off the element and writing the cleaned array back. Mirror of stop-medication but WITHOUT the required-field check.",
+      "auth": "authCheck (router-level). No auditLog, no aiUsageCheck, no status gate. In-handler gate: prescription.visit.patientUserId === req.user.id.",
+      "successStatus": 200,
+      "responseShape": "{ \"message\": \"Resumed Amoxicillin\", \"medications\": [ { \"drugName\": \"Amoxicillin\", \"dosage\": \"500mg\", \"frequency\": \"Three times daily\", \"duration\": \"7 days\", \"instructions\": \"\" }, { ...other elements verbatim... } ] }  // 2 keys. The targeted element has stoppedAt and stoppedByPatient REMOVED (keys absent, not null); all other keys survive with their original relative order. medications is [] (empty array, never null) when the stored value was not an array.",
+      "requestBody": [
+        "medicationIndex: number — NOT validated for presence (unlike stop-medication). Only bounds-checked."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "prescriptions: UPDATE medications = <the whole rebuilt array> (no transaction)"
+      ],
+      "crossModelReads": [],
+      "externalDeps": [],
+      "sideEffects": [
+        "None — no notification, email, push, audit, or reminder re-creation. Resuming does NOT restore the medication Reminder rows (they were never deleted by stop, so they simply continued).",
+        "No cache invalidation."
+      ],
+      "errorCases": [
+        "404 {\"error\":\"Prescription not found\"}",
+        "403 {\"error\":\"Not your prescription\"}",
+        "400 {\"error\":\"Invalid medication index\"} when medicationIndex < 0 or >= meds.length",
+        "500 {\"error\":\"Failed to resume medication\"} — notably this is what a MISSING medicationIndex produces (see quirks), not a 400",
+        "401 from authCheck; 429 from the global limiter"
+      ],
+      "quirks": [
+        "MISSING medicationIndex yields 500, not 400. There is no `is required` check: undefined passes both bounds comparisons (undefined < 0 and undefined >= n are both false), then `const { stoppedAt, stoppedByPatient, ...cleanMed } = meds[undefined]` destructures undefined and throws a TypeError, caught as 500 {\"error\":\"Failed to resume medication\"}. This asymmetry with stop-medication (which returns 400) must be preserved.",
+        "null medicationIndex behaves differently again: `null < 0` is false and `null >= n` is false for n>0, so it also reaches the destructure of meds[null] -> undefined -> 500. But when meds is [] , `null >= 0` is TRUE, so it returns 400 'Invalid medication index'.",
+        "NaN/non-numeric index (\"abc\") passes bounds, meds[\"abc\"] is undefined, destructuring undefined throws -> 500 (whereas stop-medication returns 200 for the same input).",
+        "Key REMOVAL, not nulling: the response element must omit stoppedAt/stoppedByPatient entirely. A port that sets them to null produces a different JSON body and the client's `med.stoppedAt` truthiness check for the Stop/Resume button still works but the byte contract is broken.",
+        "Rest-spread reorders nothing for the surviving keys, but the cleaned element is a NEW object — original insertion order of the remaining keys is preserved.",
+        "message is `Resumed ${meds[medicationIndex].drugName}` computed AFTER the element was replaced by cleanMed; if the original element only had stoppedAt/stoppedByPatient (no drugName) the message is \"Resumed undefined\" with a 200.",
+        "Resuming an element that was never stopped is a legal no-op returning 200 with the array unchanged.",
+        "No status gate, no deletedAt filter, whole-array last-write-wins, same as stop-medication."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/check-interactions",
+      "nodeLines": "L735-L868",
+      "summary": "Aggregates the caller-supplied drug names with every active drug it can discover for the patient (subprofile CurrentMedication rows, all non-stopped medications across all their prescriptions from any physician, and all family subprofiles' current meds), dedupes them, then runs the two-stage OpenFDA + LLM checker and logs an InteractionAlert row. Returns interactions + drugsChecked + a message.",
+      "auth": "authCheck ONLY (router-level). NO aiUsageCheck (this AI endpoint is unmetered, unlike transcribe-rx), NO auditLog, NO physician/patient gate, NO ownership check on subprofileId or visitId. Any authenticated user may pass any visitId or subprofileId.",
+      "successStatus": 200,
+      "responseShape": "Two distinct 200 shapes.\n\n(A) Early return when fewer than 2 distinct drugs resolve (L806):\n{ \"interactions\": [], \"drugsChecked\": [\"Metformin\"], \"message\": \"Only 1 active medication found — no interactions to check\" }\n  - interactions is ALWAYS an empty array here (never null)\n  - drugsChecked is the deduped array, possibly [] (empty array, never null)\n  - message is exactly \"No active medications found\" when drugsChecked.length === 0, otherwise exactly \"Only 1 active medication found — no interactions to check\" (note the EM DASH U+2014 surrounded by single spaces)\n\n(B) Normal AI path (L863):\n{\n  \"interactions\": [\n    {\n      \"drug1\": \"Amoxicillin\",\n      \"drug2\": \"ALLERGY: Penicillin\",\n      \"severity\": \"HIGH\",\n      \"description\": \"Patient has a documented allergy to Penicillin. Amoxicillin may cause an allergic reaction.\",\n      \"recommendation\": \"DO NOT prescribe. Consider alternatives.\",\n      \"alternatives\": []\n    },\n    {\n      \"drug1\": \"Warfarin\",\n      \"drug2\": \"Ibuprofen\",\n      \"severity\": \"MODERATE\",\n      \"description\": \"...\",\n      \"recommendation\": \"...\",\n      \"alternatives\": [\"Acetaminophen\"]\n    }\n  ],\n  \"drugsChecked\": [\"Warfarin\", \"Ibuprofen\", \"Amoxicillin\"],\n  \"message\": \"2 interaction(s) found\"\n}\n  - interactions = [...deterministic string-match allergy warnings FIRST, ...LLM/FDA-derived entries SECOND]\n  - the LLM-derived entries are RAW JSON.parse output of model text: the six keys above are only what the prompt asks for and are NOT enforced by code. Missing/extra keys are passed through untouched.\n  - alternatives is an array (may be empty); it is never normalized.\n  - message is exactly `${n} interaction(s) found` when n > 0, else exactly \"No known interactions detected\"\n  - drugsChecked is the same deduped array that was sent to the checker, in insertion order: caller-supplied medications first, then discovered drugs",
+      "requestBody": [
+        "medications?: array (defaults to [] via destructuring default; also treated as [] if not an array). The client sends an array of plain DRUG NAME STRINGS (PrescriptionPanel L158/L218, DrugScreeningsPage L82/L109, PatientProfilePage L160). PrescriptionsPage L266 sends an entirely empty body {}.",
+        "subprofileId?: string — used unvalidated to pull CurrentMedication rows and (with allergies/conditions) build AI context",
+        "visitId?: string — used unvalidated to resolve visit.patientUserId"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "interaction_alerts: INSERT { physicianId: physician?.id || null, patientUserId: !physician ? req.user.id : null, drugs: allDrugs (JSON), interactions: result.interactions (JSON), alertCount: result.interactions.length } — wrapped in try/catch, failure is logged and swallowed",
+        "ai_audit_logs: INSERT via aiGateway.logAudit for the drug_check chat call and for the checkDrugs summary (provider recorded as 'fda_label+llm' or 'llm_only')",
+        "no transaction anywhere"
+      ],
+      "crossModelReads": [
+        "CurrentMedication (findMany where subprofileId + isActive, select drugName)",
+        "Visit (findUnique by visitId, select patientUserId)",
+        "Prescription (findMany where visit.patientUserId and status in SIGNED/CONFIRMED/SENT/DISPENSED, select medications)",
+        "FamilySubprofile (findMany where patientProfile.userId = patientUserId, select id; and findFirst for the allergy/condition context subprofile)",
+        "Allergy (findMany where subprofileId + isActive, select allergen)",
+        "ChronicCondition (findMany where subprofileId + isActive, select name)",
+        "PhysicianProfile (findUnique by userId, only to decide which column of the InteractionAlert row to fill)",
+        "InteractionAlert (create)",
+        "AiAuditLog (create, inside aiGateway)"
+      ],
+      "externalDeps": [
+        "aiGateway.checkDrugs (lazily required)",
+        "OpenFDA https://api.fda.gov/drug/label.json — one HTTP GET per unordered drug PAIR, sequential",
+        "OpenFDA https://api.fda.gov/drug/event.json — one HTTP GET per pair, sequential",
+        "aiGateway.chat -> OpenAI/Gemini/MicroMind chain (agent 'drug_check' routes to gemini-2.0-flash first), temperature 0.1, maxTokens 2000, useCache:false"
+      ],
+      "sideEffects": [
+        "InteractionAlert history row (surfaced by GET /interaction-history)",
+        "AiAuditLog rows that count toward the monthly AI quota of OTHER endpoints (this endpoint itself is unmetered but its logAudit rows are what aiUsageCheck counts elsewhere)",
+        "Outbound calls to api.fda.gov — O(n^2) requests in the number of drugs, twice (labels + events), no caching, no parallelism, no timeout",
+        "No notification, no email"
+      ],
+      "errorCases": [
+        "500 {\"error\":\"Failed to check interactions\"} on any throw (including an object-typed entry in `medications` reaching drug.toLowerCase() when the patient has allergies, and any unhandled prisma error)",
+        "401 {\"error\":\"No token provided\"} / {\"error\":\"Invalid token\"} from authCheck",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global limiter",
+        "NOTE: there is NO 400 and NO 403 on this route at all — no input validation, no role check, no ownership check"
+      ],
+      "quirks": [
+        "The \"Only 1 active medication found — no interactions to check\" message contains an EM DASH (—, U+2014) with a space on each side. Byte-identical output requires the exact character.",
+        "\"${n} interaction(s) found\" — literal parenthesised (s), never pluralized differently.",
+        "IDOR: visitId and subprofileId are never authorization-checked. Any authenticated user can pass another patient's visitId and receive that patient's full active drug list back in `drugsChecked`. A faithful port reproduces this; flag it to the team rather than silently fixing it, because the response contract depends on it.",
+        "Caller identity fallback: when visitId is absent and req.user.userType !== 'PHYSICIAN', patientUserId defaults to req.user.id — so a physician calling with no visitId gets NO auto-discovery (only the drugs they typed), while a patient gets full auto-discovery. Same request body, different result by userType.",
+        "The all-family-subprofiles sweep runs ONLY when subprofileId is falsy. Passing subprofileId narrows discovery to that one subprofile.",
+        "Allergy/condition context uses `subprofileId || (findFirst FamilySubprofile for patientUserId)` with NO orderBy — the chosen subprofile is DB-order-arbitrary, so a patient's allergies may actually be a random family member's. Wrapped in a bare `catch { }` that silently continues with empty allergies.",
+        "Deduplication is `[...new Set([...inputMeds, ...existingDrugs].filter(Boolean))]` — CASE SENSITIVE. \"Aspirin\" and \"aspirin\" are two distinct drugs in drugsChecked and generate an extra FDA pair lookup.",
+        "Ordering of drugsChecked is insertion order: caller medications first, then subprofile CurrentMedication, then prescription medications (in prescription then array order), then family subprofile meds. A port using a HashSet loses this order and changes the JSON.",
+        "Stopped medications are skipped via `.filter(m => !m.stoppedAt)`; the fallback `.map(m => m.drugName || m)` means a medications array of bare strings is also supported.",
+        "Prescription discovery includes SIGNED (never sent) prescriptions, and does NOT filter deletedAt.",
+        "interactions entries are unvalidated LLM JSON. The client (DrugScreeningsPage L91-L101) reads only drug1/drug2/severity/description/recommendation and maps severity HIGH->SEVERE, MODERATE->MODERATE, LOW->MILD, falling through to the raw value for anything else — so severity is contractually one of the three uppercase strings but not enforced.",
+        "Two different fallback shapes exist inside checkDrugs when the LLM output is unparseable or the LLM call throws: entries become { drug1, drug2, severity, description, recommendation: 'Review patient history and monitor closely.', alternatives: [] } with severity derived as 'MODERATE' for fda_label source, else eventCount > 100 -> 'HIGH', > 20 -> 'MODERATE', else 'LOW', and description falling back to `FDA reports ${eventCount || '?'} adverse events. Reactions: ${reactions.join(', ')}`.",
+        "Allergy string-match warnings are PREPENDED (allergyWarnings first, then enrichedInteractions) and use bidirectional substring matching, so a patient allergic to \"Pen\" flags every drug containing \"pen\".",
+        "This endpoint bypasses aiUsageCheck entirely — a FREE-tier user has unlimited drug checks here while transcribe-rx is capped. Do not \"fix\" this during the port without a decision.",
+        "useCache:false on the reasoning chat means every call hits the model; results are never deduped.",
+        "The handler ignores checkDrugs' own drugsChecked and re-emits its local allDrugs (same reference, so identical output).",
+        "The global XSS sanitizer rewrites every string in medications before use (e.g. a drug name containing `url(` becomes `url\\(`), which then propagates into drugsChecked and the FDA query strings."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/extract-from-plan",
+      "nodeLines": "L1078-L1143",
+      "summary": "Physician-only. Sends the SOAP Plan free text to the LLM and returns a normalized array of medication objects. Always 200 with a medications array once the physician gate passes — parse failures are swallowed and return an empty array with no error key.",
+      "auth": "authCheck (router-level). NO aiUsageCheck (unmetered AI call). NO auditLog. In-handler gate: a PhysicianProfile must exist for req.user.id, else 403.",
+      "successStatus": 200,
+      "responseShape": "{ \"medications\": [ { \"drugName\": \"Amoxicillin\", \"dosage\": \"500mg\", \"frequency\": \"Three times daily\", \"duration\": \"7 days\", \"instructions\": \"\" } ] }  // exactly 1 key. Every element has exactly these 5 keys in exactly this order, every value a trimmed STRING (never null, never undefined — missing fields become \"\"). medications is [] (empty array, never null) when the AI returned nothing, returned non-array JSON, threw a parse error, or produced text with no [...] block. There is NO parseError key on this endpoint (unlike transcribe-rx) and NO count/message key.",
+      "requestBody": [
+        "planText: string, REQUIRED. Must be truthy and planText.trim().length >= 5."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "ai_audit_logs: INSERT via aiGateway.logAudit (agent 'specialty_extract')",
+        "No other writes — this endpoint creates no Prescription"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId — existence gate only)",
+        "AiAuditLog (created inside aiGateway)"
+      ],
+      "externalDeps": [
+        "aiGateway.chat (lazily required) with temperature 0.1, maxTokens 1000, useCache:false, metadata { agent: 'specialty_extract', userId }",
+        "Provider chain: 'specialty_extract' is NOT in AGENT_MODEL_DEFAULTS, so it uses AI_PRIMARY_PROVIDER (default 'openai', gpt-4o) then AI_FALLBACK_PROVIDER (default 'gemini') then 'micromind'"
+      ],
+      "sideEffects": [
+        "AiAuditLog row(s) — these count toward the caller's monthly AI quota enforced by aiUsageCheck on OTHER endpoints",
+        "logger.info with the extracted count",
+        "No DB writes to prescriptions, no notification, no email"
+      ],
+      "errorCases": [
+        "400 {\"error\":\"Plan text is required\"} when planText is falsy OR planText.trim().length < 5",
+        "403 {\"error\":\"Only physicians can extract prescriptions\"} when no PhysicianProfile for req.user.id",
+        "500 {\"error\":\"Failed to extract medications\"} on any throw — including a non-string planText (planText.trim is not a function), and including aiGateway throwing 'AI Gateway: All providers failed. Last error: ...' or 'Prompt too long (N chars, max 50000)'",
+        "401 from authCheck; 429 from the global limiter",
+        "413 from express.json({limit:'10mb'}) for oversized bodies (handled by the global error handler)"
+      ],
+      "quirks": [
+        "A non-string planText (number, object, array) reaches `.trim()` and throws -> 500 {\"error\":\"Failed to extract medications\"}, NOT 400. Only null/undefined/'' /0/false take the 400 path.",
+        "AI parse failures are INVISIBLE to the client: the catch only logs, then the handler returns 200 { medications: [] }. The client (PrescriptionPanel L277) can only distinguish this from 'AI found nothing' by the empty array, and shows 'No medications found in the Plan text'. A port must NOT add an error field.",
+        "Extraction uses a GREEDY regex `/\\[[\\s\\S]*\\]/` on the raw model text — it matches from the FIRST '[' to the LAST ']' in the whole response. Prose containing brackets before or after the JSON array will corrupt the match and produce [] via the swallowed parse error. Reproduce the greedy regex, not a JSON-aware parser, or outputs diverge.",
+        "When the regex does NOT match at all, `medications` stays [] and NO catch runs — silent empty result.",
+        "When JSON.parse succeeds but yields a non-array (e.g. a single object), medications is reset to [] .",
+        "Filter is `m => m && m.drugName` — elements without a truthy drugName are DROPPED silently, so the returned array can be shorter than what the model produced and indices do not correspond.",
+        "Normalization forces String(...) then .trim() on all five fields, so a numeric dosage 500 from the model becomes the string \"500\". null/undefined become \"\" (because `String(m.x || '')`). Note the `|| ''` means a literal 0 or false also becomes \"\".",
+        "Key order in each element is fixed by the object literal: drugName, dosage, frequency, duration, instructions. Byte-identical JSON depends on this order.",
+        "There is NO markdown code-fence stripping here (unlike transcribe-rx, which does .replace(/```json/) first) — extract-from-plan relies solely on the bracket regex, which happens to survive fences.",
+        "Unmetered: no aiUsageCheck, so a FREE-tier physician can call this without limit even though the parallel transcribe-rx endpoint is capped.",
+        "The global XSS sanitizer mutates planText before the LLM sees it: HTML tags, on*= handlers, `javascript:`/`data:`/`vbscript:` prefixes are stripped and every `url(` becomes `url\\(`. A port that skips the sanitizer sends a different prompt and can get different medications back.",
+        "useCache:false — identical planText always re-hits the model (contrast with transcribe-rx's parse call, which caches)."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/transcribe-rx",
+      "nodeLines": "L960-L1069 (multer config L960-L969, aiUsageCheck import L970, route L972-L1069)",
+      "summary": "Physician-only voice dictation. Multipart audio -> Whisper transcript -> second LLM call that parses the transcript into structured medications. Returns transcript + medications, with a DIFFERENT response shape when the medication parse fails.",
+      "auth": "authCheck (router-level) -> rxUpload.single('audio') (multer, memory storage, 25MB, audio/* only) -> aiUsageCheck('scribe') -> handler. In-handler gate: PhysicianProfile must exist for req.user.id. NOTE the middleware order: the file is fully uploaded and buffered BEFORE the quota check, and the quota check runs BEFORE the physician check.",
+      "successStatus": 200,
+      "responseShape": "Two distinct 200 shapes.\n\n(A) Success (L1063):\n{ \"transcript\": \"Amoxicillin 500 milligrams three times a day for seven days\", \"medications\": [ { \"drugName\": \"Amoxicillin\", \"dosage\": \"500mg\", \"frequency\": \"Three times daily\", \"duration\": \"7 days\", \"instructions\": \"\" } ], \"transcribeDuration\": 12.34 }\n  - exactly 3 keys; NO parseError key\n  - transcript is a string\n  - medications elements have exactly the 5 keys in that order, all trimmed strings, never null; the array is [] (empty, never null) when the model returned a non-array or an array with no usable drugName\n  - transcribeDuration is a NUMBER of SECONDS (Whisper's duration, 0 when the provider omits it) — note the key is transcribeDuration, not `duration`, and it comes from transcribeResult.duration\n\n(B) Medication-parse failure (L1050):\n{ \"transcript\": \"...\", \"medications\": [], \"parseError\": \"Could not parse medications from transcript. Please add them manually.\" }\n  - exactly 3 keys; transcribeDuration is ABSENT on this branch",
+      "requestBody": [
+        "multipart/form-data",
+        "audio: REQUIRED file field, exactly the field name 'audio', single file. Client sends a webm Blob named 'rx_dictation.webm' (PrescriptionPanel L67-L68).",
+        "language?: text field. Defaults to 'en' when omitted or empty (`req.body.language || 'en'`). Client always sends 'en'."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "ai_audit_logs: INSERT for the Whisper transcribe call (agent 'scribe', provider 'openai', model 'whisper-1', costUsd computed from duration)",
+        "ai_audit_logs: INSERT for the parse chat call (agent 'scribe' again)",
+        "No prescription is created — the client fills the form and POSTs / separately"
+      ],
+      "crossModelReads": [
+        "User (read by aiUsageCheck for userType + subscriptionTier)",
+        "AiAuditLog (aggregated by aiUsageCheck for the monthly count; created by aiGateway)",
+        "PhysicianProfile (findUnique by userId — existence gate)"
+      ],
+      "externalDeps": [
+        "multer v2 (memoryStorage, limits.fileSize 25 * 1024 * 1024, fileFilter mimetype.startsWith('audio/'))",
+        "aiUsageLimiter.aiUsageCheck('scribe')",
+        "aiGateway.transcribe -> OpenAI Whisper (requires OPENAI_API_KEY; writes the buffer to an OS temp file, response_format 'verbose_json', a fixed medical-dictation prompt, 60s timeout, 1 retry, temp file always unlinked)",
+        "aiGateway.chat for the parse step: temperature 0.1, maxTokens 1000, useCache DEFAULT TRUE, metadata { agent: 'scribe', context: 'rx_parse', userId }"
+      ],
+      "sideEffects": [
+        "Two AiAuditLog rows per successful call, both counting toward the caller's monthly AI quota",
+        "A temp file written to os.tmpdir() as tebrazi_audio_<Date.now()>.webm and deleted in a finally block",
+        "Real OpenAI spend (Whisper per-minute + chat tokens)",
+        "No notification, email, or prescription write"
+      ],
+      "errorCases": [
+        "400 {\"error\":\"No audio file provided\"} when req.file is undefined (missing field, wrong field name, or fileFilter rejected it silently)",
+        "403 {\"error\":\"Only physicians can dictate prescriptions\"} when no PhysicianProfile for req.user.id",
+        "400 {\"error\":\"Could not transcribe audio. Please try again.\"} when the transcript is empty or trim().length < 3 — charged for the Whisper call anyway",
+        "403 {\"error\":\"Feature not available on your plan\", \"message\":\"The Medical Scribe feature requires a Pro subscription.\", \"upgradeRequired\": true, \"currentTier\":\"PATIENT_FREE\"} from aiUsageCheck when 'scribe' is not in the tier's allowedAgents (true for PATIENT_FREE and PATIENT_FAMILY; allowed on FREE, PRO, CLINIC)",
+        "429 {\"error\":\"Monthly AI limit reached\", \"message\":\"You've used 50/50 AI calls this month. Upgrade to Pro for more.\", \"upgradeRequired\": true, \"currentTier\":\"FREE\", \"usage\": { \"used\": 50, \"limit\": 50, \"totalTokens\": 12345, \"totalCost\": 0.42, \"resetsAt\": \"2026-10-01T00:00:00.000Z\" }} from aiUsageCheck",
+        "401 {\"error\":\"Authentication required\"} or {\"error\":\"User not found\"} from aiUsageCheck (distinct bodies from authCheck's)",
+        "500 {\"error\": <RAW error.message>} — this handler returns error.message, e.g. {\"error\":\"Transcription requires OPENAI_API_KEY (Whisper API)\"} or {\"error\":\"AI Gateway: All providers failed. Last error: ...\"}, falling back to {\"error\":\"Failed to transcribe prescription\"} only when message is empty",
+        "500 {\"error\":\"Only audio files are allowed\"} from the GLOBAL error handler (index.js L311) when fileFilter rejects a non-audio mimetype — multer's cb(new Error(...)) has no .status, so err.status||500 yields 500, NOT 400",
+        "500 {\"error\":\"File too large\"} from the global error handler when the 25MB limit is exceeded (MulterError has .code but no .status)",
+        "In NODE_ENV=development the global error handler ALSO adds a \"stack\" key to those two bodies",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global limiter"
+      ],
+      "quirks": [
+        "Two different success shapes: transcribeDuration is present on the happy path and ABSENT on the parseError path, and parseError is present only on the failure path. A port must not emit all four keys with nulls.",
+        "Middleware order is load-bearing: multer parses and buffers up to 25MB BEFORE aiUsageCheck runs, so an over-quota user still pays the upload; and aiUsageCheck runs BEFORE the physician check, so a PATIENT calling this gets 403 {\"error\":\"Feature not available on your plan\", ...upgradeRequired} — NOT 403 {\"error\":\"Only physicians can dictate prescriptions\"}. That second message is only reachable by a non-patient userType with no PhysicianProfile.",
+        "aiUsageCheck FAILS OPEN: any thrown error inside it (DB down, etc.) calls next() and the request proceeds unmetered.",
+        "This is the ONLY one of the seven endpoints with a quota check. check-interactions and extract-from-plan make AI calls with no metering.",
+        "500 bodies here leak the raw exception message (error.message), unlike every other handler in this file which uses a fixed string. A port must forward the underlying message.",
+        "language defaults to 'en', which DISABLES Whisper's auto-detection (aiGateway only sets whisperOptions.language when language is truthy) — so Arabic dictation is transcribed as English. The default is applied in the route, not the gateway.",
+        "The parse chat uses useCache:true (the default) with the cache key sha256(system + transcript) — two identical transcripts return the cached medications without a second model call, and the cached branch logs tokensUsed 0 / costUsd 0 so it does NOT count toward the monthly quota (aiUsageCheck filters cached:false).",
+        "metadata.agent is 'scribe' for the parse chat, which matches AGENT_MODEL_DEFAULTS.scribe = { provider:'openai', model:'whisper-1' }. Only the PROVIDER is used to reorder the chain — agentConfig.model is never passed to the provider fn — so the chat still runs on OPENAI_MODEL/gpt-4o, not whisper-1. Looks like a bug but is behaviorally inert; a port must not 'fix' it into actually selecting whisper-1.",
+        "Markdown fence stripping here is `.replace(/```json\\n?/g,'').replace(/```\\n?/g,'').trim()` then JSON.parse of the WHOLE cleaned string — different from extract-from-plan, which uses a greedy [...] regex instead. The two endpoints fail on different malformed outputs; both must be ported literally.",
+        "JSON.parse succeeding with a non-array yields medications = [] and NO parseError (falls through to shape A, including transcribeDuration).",
+        "Elements are filtered by `m && m.drugName` and normalized with String(x || '').trim() into exactly 5 keys in fixed order — same normalization as extract-from-plan.",
+        "transcript with trim().length < 3 returns 400 AFTER Whisper was billed and audited.",
+        "fileFilter rejects with an Error rather than cb(null,false), so a wrong mimetype surfaces as 500 'Only audio files are allowed'; but if it somehow yields no file, the handler's own 400 'No audio file provided' applies. Both paths exist.",
+        "The global XSS sanitizer does NOT touch this request's fields: it runs before multer populates req.body, so `language` reaches the handler unsanitized (contrast with every JSON-body endpoint in this file).",
+        "transcribeDuration is a float in SECONDS from Whisper's verbose_json, defaulted to 0 — not milliseconds, not a formatted string."
+      ]
+    }
+  ]
+}

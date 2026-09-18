@@ -1,0 +1,373 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/",
+      "nodeLines": "L31-L89",
+      "summary": "Lists prescriptions. Branches on req.user.userType: PHYSICIAN sees every prescription they authored (all statuses); anyone else (PATIENT/RECEPTIONIST/STAFF) sees only prescriptions whose visit.patientUserId is their own user id AND whose status is CONFIRMED/SENT/DISPENSED. Optional ?visitId filter. Physician results are enriched with a patientName field via a batched User lookup.",
+      "auth": "router.use(authCheck) (JWT Bearer, payload {id,email,role,userType,displayName,organizationId}) -> cacheMiddleware(15). In-handler gate: userType === 'PHYSICIAN' selects the physician branch (scoped to their own physicianProfile.id); every other userType falls into the patient branch scoped by visit.patientUserId === req.user.id. No auditLog. Global app-level rate limiter on /api (100 req/min/IP).",
+      "successStatus": 200,
+      "responseShape": "JSON ARRAY (never null; [] when empty). PHYSICIAN branch element:\n{\n  \"id\": \"uuid\",\n  \"visitId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"subprofileId\": \"uuid\" | null,\n  \"status\": \"DRAFT\"|\"SIGNED\"|\"CONFIRMED\"|\"SENT\"|\"DISPENSED\",\n  \"medications\": <raw Json column, echoed verbatim; normally an array of {drugName,dosage,frequency,duration,instructions} but may carry extra keys such as stoppedAt (ISO string) and stoppedByPatient (bool) added by the stop-medication route; can legally be any JSON value including {} or null>,\n  \"notes\": \"string\" | null,\n  \"signedAt\": \"2026-09-03T10:15:30.123Z\" | null,\n  \"sentToPatientAt\": \"ISO-8601 with ms + Z\" | null,\n  \"pdfUrl\": \"string\" | null,\n  \"refillRequestedAt\": \"ISO-8601\" | null,\n  \"refillStatus\": \"string\" | null,          // free-text column, values used elsewhere: PENDING|APPROVED|DENIED\n  \"refillNotes\": \"string\" | null,\n  \"createdAt\": \"ISO-8601\",\n  \"updatedAt\": \"ISO-8601\",\n  \"deletedAt\": \"ISO-8601\" | null,\n  \"visit\": {\n    \"id\": \"uuid\",\n    \"chiefComplaint\": \"string\" | null,\n    \"visitDate\": \"ISO-8601\",\n    \"patientUserId\": \"uuid\",              // always present, non-null column\n    \"clinic\": { \"name\": \"string\" }         // never null (clinicId is required on Visit)\n  },\n  \"physician\": {\n    \"specialty\": \"string\",                 // non-null column\n    \"user\": { \"displayName\": \"string\" }\n  },\n  \"subprofile\": { \"name\": \"string\", \"relation\": \"SELF\"|\"SPOUSE\"|\"CHILD\"|\"PARENT\"|\"SIBLING\"|\"OTHER\" } | null,\n  \"patientName\": \"string\"                  // KEY IS ABSENT (not null) when the User row is missing\n}\n\nNON-PHYSICIAN branch element: byte-identical to the above MINUS the patientName key entirely (the enrichment block only runs for userType==='PHYSICIAN').\n\nOrdering: createdAt DESC.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header is absent or does not start with 'Bearer '",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws (bad signature, expired)",
+        "200 [] (NOT an error, and it IS cached for 15s) when userType==='PHYSICIAN' but no physicianProfile row exists for req.user.id",
+        "500 {\"error\":\"Failed to list prescriptions\"} on any thrown error, incl. Prisma rejecting a repeated ?visitId=a&visitId=b (Express parses it as an array)",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the app-level /api limiter"
+      ],
+      "requestQuery": [
+        "visitId?: string — applied as an exact equality filter (where.visitId). No validation, no uuid check. If repeated in the query string Express yields an array and Prisma throws -> 500."
+      ],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId, physician branch only)",
+        "User (findMany id IN patientIds, select id+displayName — physician branch only, skipped entirely when patientIds is empty)"
+      ],
+      "externalDeps": [
+        "cacheMiddleware(15) — in-process Map cache, key `route:${req.user.id}:${req.originalUrl}`"
+      ],
+      "sideEffects": [
+        "Populates the in-memory response cache under key `route:<userId>:/api/prescriptions[?visitId=...]` for 15 seconds. Nothing in this router ever invalidates that cache."
+      ],
+      "quirks": [
+        "patientName is set to `patientMap[...] || undefined`. JSON.stringify DROPS undefined values, so the key is COMPLETELY ABSENT from the object when the patient User row is missing — a .NET port must omit the property, not emit null or \"\".",
+        "patientName is added ONLY on the physician branch. The patient branch response has no patientName key at all.",
+        "There is NO deletedAt filter. Soft-deleted prescriptions (deletedAt != null) are returned, and deletedAt itself is exposed in the payload. Same for the joined visit — soft-deleted visits still resolve.",
+        "The physician branch applies NO status filter, so DRAFT prescriptions are visible to the physician. The patient branch filter is status IN ('CONFIRMED','SENT','DISPENSED') — note SIGNED is EXCLUDED even though POST / creates prescriptions with status 'SIGNED'. A freshly created prescription is therefore invisible to the patient until /sign (->CONFIRMED) or /send (->SENT) runs.",
+        "The branch key is userType, not the presence of a physicianProfile. A RECEPTIONIST or STAFF user is treated as a patient and will see prescriptions only if visit.patientUserId happens to equal their own user id — in practice an empty array.",
+        "A PHYSICIAN with no physicianProfile gets 200 [] (early return) rather than 403/404 — and that empty array is written into the 15s cache.",
+        "The cache key includes req.originalUrl, so /api/prescriptions and /api/prescriptions?visitId=x are cached separately. Cache is per-user so there is no cross-tenant leak, but a POST/PUT in this router never invalidates it: a client that creates then immediately re-lists can see stale data for up to 15s.",
+        "Cached hits are replayed through res.json(cached) with status 200 — the cached body is the JS object, so re-serialization is identical (undefined patientName stays dropped).",
+        "medications is a Prisma Json column echoed verbatim — the server does no shaping, so any extra keys the client originally POSTed are still there. In .NET this must be a raw JSON passthrough, not a typed DTO.",
+        "physician.specialty is a required (non-null) column so it is always a string, but physician.user.displayName is also always present — neither can be null here.",
+        "visit.clinic can never be null (clinicId is required on Visit), so the client's optional chaining on it is defensive only.",
+        "subprofile IS nullable (subprofileId is optional) — emit JSON null, not an empty object.",
+        "All DateTime fields serialize as JS Date -> ISO-8601 UTC with milliseconds and trailing Z (e.g. \"2026-09-03T10:15:30.123Z\"). visitDate/createdAt/updatedAt are non-null; signedAt/sentToPatientAt/refillRequestedAt/deletedAt are nullable.",
+        "Serialization key order follows Prisma's model field order then the include order: scalars (id, visitId, physicianId, subprofileId, status, medications, notes, signedAt, sentToPatientAt, pdfUrl, refillRequestedAt, refillStatus, refillNotes, createdAt, updatedAt, deletedAt) then visit, physician, subprofile, then patientName last (it comes from the object spread).",
+        "The N+1-avoidance batch de-dupes patient ids with a Set and filters falsy ids, but visit.patientUserId is a required column so the filter is a no-op."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/summary",
+      "nodeLines": "L144-L159",
+      "summary": "Three prescription counts for the physician dashboard badge. Registered AFTER GET '/' and POST '/' but BEFORE GET '/:id' (L190), so it is not shadowed by the :id route.",
+      "auth": "router.use(authCheck) -> cacheMiddleware(30). No userType check at all — scoped purely by the caller's physicianProfile. Anyone without a physicianProfile (any patient) gets the all-zero object, not a 403.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"signed\": <int>,   // COUNT of prescriptions where physicianId = me AND status IN ('CONFIRMED','SIGNED')\n  \"sent\":   <int>,   // COUNT where physicianId = me AND status = 'SENT'\n  \"total\":  <int>    // COUNT where physicianId = me (ALL statuses, incl. DRAFT and DISPENSED)\n}\nExactly three keys, in that order. Always integers, never null.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/non-Bearer Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify failure",
+        "200 {\"signed\":0,\"sent\":0,\"total\":0} when the caller has no physicianProfile (early return, NOT an error, and it IS cached for 30s)",
+        "500 {\"error\":\"Failed to get prescription summary\"} on a thrown error",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the app-level /api limiter"
+      ],
+      "requestQuery": [],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)"
+      ],
+      "externalDeps": [
+        "cacheMiddleware(30) — key `route:${req.user.id}:/api/prescriptions/summary`"
+      ],
+      "sideEffects": [
+        "Writes the response into the 30s in-memory route cache."
+      ],
+      "quirks": [
+        "The key is called \"signed\" but the count covers status IN ('CONFIRMED','SIGNED') — TWO statuses. A .NET port that counts only SIGNED will under-report, and since POST / creates as SIGNED while PUT /:id/sign writes CONFIRMED, both states legitimately land in this bucket.",
+        "signed + sent does NOT equal total. total counts every status including DRAFT and DISPENSED, and DISPENSED/DRAFT rows appear in neither signed nor sent.",
+        "NO deletedAt filter — soft-deleted prescriptions are counted in all three numbers.",
+        "No physicianProfile -> 200 with all zeros, cached for 30s. A patient calling this endpoint therefore gets a well-formed body, never an authorization error.",
+        "The three counts run in Promise.all, i.e. three separate COUNT queries with no shared snapshot/transaction — under concurrent writes the numbers can be mutually inconsistent (e.g. total lower than signed+sent).",
+        "The 30s TTL is longer than GET /'s 15s, so the dashboard badge and the list can visibly disagree after a status change.",
+        "Values are JSON numbers (Prisma count returns a JS number). Emit as int, not string."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/:id/pdf",
+      "nodeLines": "L874-L945",
+      "summary": "Returns a complete, self-contained, print-ready HTML document for the prescription (NOT a real PDF, NOT JSON). Resolves the display name for the patient with a three-tier fallback, then hands everything to generateRxPDFHtml in server/src/services/pdfService.js. Declared at L874, well after GET '/:id' at L190, but the two-segment path means no route shadowing occurs.",
+      "auth": "router.use(authCheck) only. In-handler ownership gate AFTER the query: isPhysician = (physicianProfile exists for req.user.id) && prescription.physicianId === thatProfile.id; isPatient = prescription.visit.patientUserId === req.user.id. 403 unless one is true. No auditLog, no cacheMiddleware, no aiUsageCheck.",
+      "successStatus": 200,
+      "responseShape": "NOT JSON. Content-Type: text/html; charset=utf-8 (the handler sets 'text/html' and Express's res.send appends '; charset=utf-8'). Express also adds ETag and Content-Length, and the global compression() middleware will gzip it when the client sends Accept-Encoding. Body is the literal string returned by generateRxPDFHtml:\n\n<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>Rx {RXNUM} — {escaped physician.name}</title><style>…~100 lines of inline CSS, incl. @media print and @page {size:A4;margin:12mm}…</style></head>\n<body>\n  <button class=\"print-btn\" onclick=\"window.print()\">🖨 Print / Save PDF</button>\n  <div class=\"rx-header\">\n    <div class=\"clinic-info\">\n      [<img src=\"{clinic.logo}\" alt=\"\" style=\"height:50px;margin-bottom:6px;\" /> only when clinic.logo is truthy]\n      <h2>{clinic.name || 'Clinic'}</h2>\n      <p>{[clinic.address, clinic.city].filter(Boolean).join(', ')}</p>   <!-- empty <p></p> when both are null -->\n      [<p>Tel: {clinic.phone}</p> only when phone is truthy]\n    </div>\n    <div class=\"doc-info\">\n      <h3>Dr. {physician.user.displayName}</h3>\n      <p>{physician.specialty || ''}</p>\n      [<p>License: {licenseNumber}</p> only when truthy]\n    </div>\n  </div>\n  <div class=\"rx-symbol\">℞</div>\n  <div class=\"patient-bar\">\n    <div><strong>Patient:</strong> {patientDisplayName}</div>\n    <div><strong>Date:</strong> {rxDate}</div>\n    <div><strong>Rx #:</strong> {rxNumber}</div>\n  </div>\n  <table class=\"meds\">\n    <thead><tr><th>#</th><th>Medication</th><th>Dosage</th><th>Frequency</th><th>Duration</th></tr></thead>\n    <tbody>\n      per medication, in array order:\n      <tr><td class=\"med-num\">{i+1}</td>\n          <td class=\"med-name\"><strong>{drugName}</strong>[<div class=\"med-instr\">{instructions}</div> only when instructions truthy]</td>\n          <td>{dosage || '—'}</td><td>{frequency || '—'}</td><td>{duration || '—'}</td></tr>\n    </tbody>\n  </table>\n  [<div class=\"notes-section\"><strong>Notes:</strong> {prescription.notes}</div> only when notes is truthy]\n  <div class=\"signature-block\"><div class=\"doc-name\">Dr. {physician.name}</div><div class=\"sig-note\">Electronically signed via Tebrazi · {rxDate}</div></div>\n  <div class=\"rx-footer\">Generated by Tebrazi — Digital Healthcare Platform &nbsp;|&nbsp; tebrazi.com</div>\n</body>\n</html>\n\nDerived values a port must reproduce exactly:\n  rxNumber = prescription.id.slice(0,8).toUpperCase()   // first 8 chars of the uuid, upper-cased, hyphen included if present\n  rxDate   = new Date(prescription.signedAt || prescription.createdAt).toLocaleDateString('en-GB', {day:'2-digit', month:'short', year:'numeric'})  // e.g. \"03 Sep 2026\" — Node full-ICU en-GB, day-month-year, no comma\n  patientDisplayName: 1) if prescription.subprofile -> `${subprofile.name} (${subprofile.relation})` with the RAW ENUM, e.g. \"Ahmed (CHILD)\"; 2) else if visit.clinicPatient?.name -> that name; 3) else User.displayName for visit.patientUserId; 4) else the literal 'Patient'.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/non-Bearer header (JSON, application/json)",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify failure",
+        "404 {\"error\":\"Prescription not found\"} when no row has that id (JSON, not HTML)",
+        "403 {\"error\":\"Access denied\"} when the caller is neither the authoring physician nor visit.patientUserId (JSON, not HTML)",
+        "500 {\"error\":\"Failed to generate PDF\"} on any thrown error",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the app-level /api limiter"
+      ],
+      "requestQuery": [],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId, for the access check)",
+        "User (findUnique by visit.patientUserId, select displayName — ONLY reached when there is no subprofile AND no clinicPatient.name)",
+        "Clinic (nested select on visit: name, address, city, phone, logo)",
+        "ClinicPatient (nested select on visit: name)",
+        "FamilySubprofile (nested select: name, relation)"
+      ],
+      "externalDeps": [
+        "server/src/services/pdfService.js -> generateRxPDFHtml (pure string builder, no I/O, no headless browser)",
+        "compression() app middleware gzips the HTML body"
+      ],
+      "sideEffects": [],
+      "quirks": [
+        "This endpoint is named /pdf but emits text/html — no PDF bytes, no application/pdf, no Content-Disposition. The client fetches it with axios responseType:'text' and document.write()s it into a new window (client/src/pages/PrescriptionsPage.jsx handleDownloadPDF, client/src/components/PrescriptionPanel.jsx). A .NET port MUST keep returning HTML, not generate a real PDF.",
+        "SUCCESS is HTML but every ERROR is JSON. Content-Type flips per branch because res.setHeader('Content-Type','text/html') runs only on the happy path, after all the checks.",
+        "Final success Content-Type is 'text/html; charset=utf-8' — Express's res.send appends the charset to the header the handler set. Emitting bare 'text/html' would not match.",
+        "The prescription is fetched BEFORE the authorization check, so an unauthorized caller still triggers the full joined query (timing/side-channel only, but the query order matters if you port it as a single guarded statement).",
+        "NO deletedAt filter — a soft-deleted prescription still renders a full PDF.",
+        "The subprofile branch WINS over clinicPatient and over the platform User. When a subprofile exists the patient name always reads \"Name (RELATION)\" with the raw uppercase enum (SELF/SPOUSE/CHILD/PARENT/SIBLING/OTHER) — it is never localized or prettified.",
+        "patientDisplayName is initialized to 'Patient' and the final else-branch also falls back to 'Patient' when the User row is missing, so an anonymous \"Patient\" is a real, reachable output.",
+        "rxDate uses signedAt WITH createdAt fallback. For a DRAFT (signedAt null) the printed date is the creation date, and the signature block claims \"Electronically signed via Tebrazi · {that date}\" even for an unsigned prescription.",
+        "rxDate is produced by JS toLocaleDateString('en-GB') and depends on the process's ICU data and default timezone — the date shown is the SERVER-LOCAL calendar day of the UTC instant. A .NET port must format with en-GB \"dd MMM yyyy\" against the server's local timezone to match.",
+        "toLocaleDateString('en-GB', month:'short') yields \"03 Sep 2026\" (no comma, zero-padded day, three-letter month, no trailing period).",
+        "rxNumber is a naive id.slice(0,8) — for a standard uuid that is the first hex group (8 chars, no hyphen), but the code makes no assumption, so if ids ever get shorter/other-shaped it just takes whatever is there.",
+        "escapeHtml() escapes & < > \" ' (apostrophe as &#39;) and returns '' for ANY falsy input including 0 and false. The `escapeHtml(x) || '—'` idiom therefore renders an em dash (U+2014) for empty/missing dosage, frequency and duration — not an empty cell.",
+        "`escapeHtml(med.drugName) || ''` for the drug name has NO em-dash fallback: a medication with no drugName renders <strong></strong>.",
+        "clinic.logo is injected into src=\"...\" after escapeHtml — but the global request-body sanitizer does not touch DB-stored values, so whatever URL is in the DB goes straight into the img tag.",
+        "`clinic: prescription.visit.clinic || { name: 'Clinic' }` is dead defensive code — Visit.clinicId is required, so clinic is never null. The `escapeHtml(clinic.name) || 'Clinic'` fallback is likewise unreachable in practice (Clinic.name is non-null).",
+        "medications: `Array.isArray(...) ? ... : []` — a non-array Json value yields an EMPTY <tbody> (the table header still renders). Never null, never an error.",
+        "The address <p> renders as an empty <p></p> element when both clinic.address and clinic.city are null — the tag is always emitted.",
+        "The HTML contains an inline onclick=\"window.print()\" button and emoji (🖨, ℞) — must be byte-preserved and served as UTF-8.",
+        "Every template hole is interpolated from a template literal, so leading/trailing whitespace and newlines inside the markup are part of the response body. Byte-identical output requires reproducing the template's exact indentation, including the trailing newline pattern of the medicationRows .map(...).join('') (each row starts with a newline and is indented 4 spaces).",
+        "The medications array order is the stored order — no sorting, no filtering of patient-stopped meds (a med with stoppedAt still prints)."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/",
+      "nodeLines": "L99-L138",
+      "summary": "Physician creates a prescription against one of their own visits. AUTO-SIGNS at creation: status is written as 'SIGNED' and signedAt as now(), so the /sign endpoint is not required. subprofileId is inherited from the visit, not from the request body.",
+      "auth": "router.use(authCheck) -> auditLog('CREATE','prescription') -> handler. In-handler gate: the caller MUST have a physicianProfile (else 400), and the target visit must satisfy {id: visitId, physicianId: myProfile.id} (else 403). NO userType check — a non-PHYSICIAN userType that somehow owns a physicianProfile would pass.",
+      "successStatus": 201,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"visitId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"subprofileId\": \"uuid\" | null,        // copied from visit.subprofileId, NOT from the request\n  \"status\": \"SIGNED\",                   // always literally SIGNED on create\n  \"medications\": <the request array echoed back verbatim from the Json column, extra keys and all>,\n  \"notes\": \"string\" | null,\n  \"signedAt\": \"ISO-8601\",               // always set on create, never null here\n  \"sentToPatientAt\": null,\n  \"pdfUrl\": null,\n  \"refillRequestedAt\": null,\n  \"refillStatus\": null,\n  \"refillNotes\": null,\n  \"createdAt\": \"ISO-8601\",\n  \"updatedAt\": \"ISO-8601\",\n  \"deletedAt\": null,\n  \"visit\": { \"chiefComplaint\": \"string\" | null, \"visitDate\": \"ISO-8601\" }   // ONLY these two keys — NO id\n}",
+      "errorCases": [
+        "400 {\"error\":\"visitId and at least one medication are required\"} when visitId is falsy, OR medications is falsy, OR medications is not an Array, OR medications.length === 0",
+        "400 {\"error\":\"Physician profile required\"} when no physicianProfile row exists for req.user.id — note this is 400, NOT 403",
+        "403 {\"error\":\"Visit not found or not yours\"} when no visit matches {id: visitId, physicianId: myProfile.id} — a nonexistent visit id also yields 403, never 404",
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "500 {\"error\":\"Failed to create prescription\"} on any thrown error (e.g. an FK violation)",
+        "413 (Express raw error) when the JSON body exceeds the 10mb express.json limit",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the app-level /api limiter"
+      ],
+      "requestBody": [
+        "visitId: string — REQUIRED (truthiness check only, no uuid validation)",
+        "medications: array — REQUIRED, must be a non-empty Array. Element shape is NOT validated at all: the array is stored raw into the Json column. The documented element shape is {drugName, dosage, frequency, duration, instructions} but any JSON is accepted, including primitives, nulls, or objects with none of those keys.",
+        "notes?: string — optional; stored as `notes || null` so '' , 0 and false all become NULL",
+        "(any other body keys are silently ignored — subprofileId, status, signedAt from the client are NOT honored)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "prescriptions — INSERT (NOT in a transaction). Columns set: visitId, physicianId, subprofileId, medications, notes, status='SIGNED', signedAt=now(); the rest take schema defaults (status default DRAFT is overridden, id uuid, createdAt/updatedAt now(), pdfUrl/sentToPatientAt/refill*/deletedAt null).",
+        "activity_logs — INSERT via the auditLog middleware, fire-and-forget (.catch(()=>{})), NOT in a transaction, and it runs on the res.json interception so it can complete after the response is flushed."
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "ActivityLog (write-only, via auditLog middleware)"
+      ],
+      "externalDeps": [
+        "auditLog middleware (server/src/middleware/audit.js)",
+        "Global body sanitizer in server/src/index.js (see quirks)"
+      ],
+      "sideEffects": [
+        "activity_logs row: {userId: req.user.id, action:'CREATE', resource:'prescription', resourceId: <new prescription id>, metadata:{method:'POST', path:'/api/prescriptions'}, ipAddress: req.ip, userAgent: first 256 chars of the UA header}. Only written when res.statusCode < 400, so the 400/403 branches log nothing.",
+        "No notification is sent, no reminder is created, and NO route cache is invalidated — GET / and GET /summary keep serving pre-create data for up to 15s / 30s."
+      ],
+      "quirks": [
+        "Named 'create' but it AUTO-SIGNS: status='SIGNED' and signedAt=new Date(). A port that respects the schema default (DRAFT) breaks the whole downstream flow.",
+        "The created row's status 'SIGNED' is NOT in the patient list filter of GET / ('CONFIRMED','SENT','DISPENSED'), so the patient cannot see a just-created prescription until /sign or /send runs.",
+        "The 201 response's nested visit object has ONLY chiefComplaint and visitDate — no id, no patientUserId, no clinic. This is a DIFFERENT visit shape from GET / and GET /:id. The response also has no physician and no subprofile object at all.",
+        "Missing physician profile returns 400, not 403 — but a foreign/nonexistent visit returns 403, not 404. Both status codes are counter-intuitive and must be copied exactly.",
+        "The visit lookup uses findFirst with no deletedAt filter, so a SOFT-DELETED visit still accepts new prescriptions.",
+        "subprofileId is silently taken from visit.subprofileId. If the visit has none (a clinicPatient-chart visit), subprofileId is null and the PDF route will then fall back to clinicPatient.name.",
+        "notes uses `notes || null`, so an empty-string notes field is persisted as SQL NULL, not ''.",
+        "medications is stored with zero server-side normalization — no trimming, no drugName requirement per element, no dedup. `[null]` and `[{}]` and `[1,2,3]` are all accepted (length 1, Array.isArray true).",
+        "GLOBAL BODY SANITIZER: server/src/index.js recursively rewrites every string in req.body before this handler sees it — it strips <script>/<iframe>/<style>/etc. tags and on*= handlers, deletes the substrings 'javascript:', 'data:' and 'vbscript:' (case-insensitive), strips 'expression(' and rewrites 'url(' to 'url\\('. So a drug name or instruction containing e.g. 'data:' or 'url(' is MUTATED before storage. A .NET port must reproduce this sanitizer to keep stored values identical.",
+        "The auditLog middleware picks resourceId as `req.params?.id || data?.id` — on POST / there is no :id param so it uses the new prescription's id from the response body.",
+        "No transaction wraps the insert plus the audit row; the audit insert is fire-and-forget and its failure is swallowed silently.",
+        "Response key order is Prisma model order for scalars, then `visit` last."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/sign",
+      "nodeLines": "L280-L302",
+      "summary": "Sets the prescription's status to CONFIRMED (not SIGNED) and stamps signedAt=now(). Ownership-checked against the caller's physicianProfile. No status precondition whatsoever.",
+      "auth": "router.use(authCheck) only. In-handler gate: physicianProfile must exist for req.user.id AND prescription.physicianId must equal that profile's id, else 403. No auditLog, no userType check, no cacheMiddleware.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"visitId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"subprofileId\": \"uuid\" | null,\n  \"status\": \"CONFIRMED\",              // ALWAYS the literal CONFIRMED, never SIGNED\n  \"medications\": <raw Json, unchanged>,\n  \"notes\": \"string\" | null,\n  \"signedAt\": \"ISO-8601\",             // freshly set to now(), never null in this response\n  \"sentToPatientAt\": \"ISO-8601\" | null,\n  \"pdfUrl\": \"string\" | null,\n  \"refillRequestedAt\": \"ISO-8601\" | null,\n  \"refillStatus\": \"string\" | null,\n  \"refillNotes\": \"string\" | null,\n  \"createdAt\": \"ISO-8601\",\n  \"updatedAt\": \"ISO-8601\",            // bumped by @updatedAt\n  \"deletedAt\": \"ISO-8601\" | null,\n  \"message\": \"Prescription signed\"    // extra key appended by the object spread, LAST\n}\nFlat — no visit, no physician, no subprofile objects (the update call has no include).",
+      "errorCases": [
+        "404 {\"error\":\"Prescription not found\"} when no row has that id",
+        "403 {\"error\":\"Not your prescription\"} when the caller has no physicianProfile OR prescription.physicianId !== myProfile.id (both conditions collapse into this one message)",
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "500 {\"error\":\"Failed to sign prescription\"} on any thrown error",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the app-level /api limiter"
+      ],
+      "requestBody": [
+        "NONE. The body is read but never used — the client sends no body at all (api.put(`/prescriptions/${id}/sign`))."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "prescriptions — UPDATE SET status='CONFIRMED', signedAt=now(), updatedAt=now() WHERE id=:id. NOT in a transaction."
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)"
+      ],
+      "externalDeps": [],
+      "sideEffects": [
+        "None — no notification, no reminder, no audit row, no cache invalidation. GET / and GET /summary keep serving the pre-sign status for up to 15s/30s."
+      ],
+      "quirks": [
+        "THE BIG ONE: the endpoint called /sign writes status 'CONFIRMED', while POST / writes 'SIGNED'. The PrescriptionStatus enum has both. A port that writes SIGNED here silently breaks the patient list filter and the /summary counts are unaffected only because 'signed' counts BOTH.",
+        "NO status precondition. Signing a prescription that is already SENT or DISPENSED succeeds and REGRESSES its status back to CONFIRMED, while leaving sentToPatientAt populated — producing a row that is CONFIRMED but has a sentToPatientAt timestamp.",
+        "signedAt is overwritten on every call, so re-signing loses the original signature timestamp.",
+        "No deletedAt filter — a soft-deleted prescription can be signed.",
+        "The 403 message 'Not your prescription' is emitted both for 'caller is not a physician at all' and for 'prescription belongs to another physician'. There is no distinct 'physician profile required' message here (unlike POST /, which uses 400 'Physician profile required').",
+        "The prescription row is fetched with a bare findUnique and then updated in a separate statement — a classic read-then-write with no optimistic concurrency, so two concurrent signs both succeed.",
+        "The `message` key is appended by `{...updated, message: ...}` so it serializes LAST, after deletedAt. The client does not read it, but byte-identical JSON requires the key and its exact string 'Prescription signed'.",
+        "There is a separate PUT '/:id' route at L242 that DOES guard on status==='SENT'; /:id/sign has no such guard. Route order is fine — '/:id' cannot shadow '/:id/sign' because of the extra path segment.",
+        "No auditLog middleware on this route, unlike POST /."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/send",
+      "nodeLines": "L308-L435",
+      "summary": "Sets status to SENT + sentToPatientAt=now(), notifies the patient (in-app + email + push), then AUTO-CREATES daily-recurring MEDICATION reminders for every medication that has both a drugName and a frequency — first deleting any existing ACTIVE MEDICATION reminders whose title contains that drug name. Both the notification and the reminder blocks are individually try/catch-swallowed, so the response never reflects their failure.",
+      "auth": "router.use(authCheck) only. In-handler gate: physicianProfile must exist for req.user.id AND prescription.physicianId === that profile's id, else 403. No auditLog, no userType check.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"visitId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"subprofileId\": \"uuid\" | null,\n  \"status\": \"SENT\",                        // always the literal SENT\n  \"medications\": <raw Json, UNCHANGED — send never rewrites medications>,\n  \"notes\": \"string\" | null,\n  \"signedAt\": \"ISO-8601\" | null,           // NOT touched here; can still be null if the row was a DRAFT\n  \"sentToPatientAt\": \"ISO-8601\",           // freshly set, never null in this response\n  \"pdfUrl\": \"string\" | null,\n  \"refillRequestedAt\": \"ISO-8601\" | null,\n  \"refillStatus\": \"string\" | null,\n  \"refillNotes\": \"string\" | null,\n  \"createdAt\": \"ISO-8601\",\n  \"updatedAt\": \"ISO-8601\",\n  \"deletedAt\": \"ISO-8601\" | null,\n  \"message\": \"Prescription sent to patient\"   // LAST key, from the spread\n}\nFlat — no include, so no visit/physician/subprofile. NOTHING about the notification or the created reminders appears in the response (no count, no ids).",
+      "errorCases": [
+        "404 {\"error\":\"Prescription not found\"} when no row has that id",
+        "403 {\"error\":\"Not your prescription\"} when the caller has no physicianProfile OR the prescription belongs to another physician",
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "500 {\"error\":\"Failed to send prescription\"} — reachable ONLY from the findUnique / physicianProfile lookup / the status UPDATE itself; every notification and reminder failure is caught and logged, never surfaced",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the app-level /api limiter"
+      ],
+      "requestBody": [
+        "NONE. Body is never read. The client calls api.put(`/prescriptions/${id}/send`) with no payload."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "prescriptions — UPDATE SET status='SENT', sentToPatientAt=now(), updatedAt=now() WHERE id=:id. NOT in a transaction, and it happens BEFORE all the side effects.",
+        "notifications — INSERT (type 'PRESCRIPTION_SENT'), best-effort in its own try/catch",
+        "reminders — DELETE MANY per medication: WHERE userId=<patient> AND type='MEDICATION' AND title CONTAINS <drugName> AND status='ACTIVE'",
+        "reminders — INSERT one row per dose time per medication (1-12 rows per med), best-effort",
+        "notifications — a SECOND INSERT (type 'MEDICATION_REMINDER_SET') only when remindersCreated > 0",
+        "device_tokens — possible DELETE MANY of dead tokens inside pushService, per notification"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "Visit (findUnique by prescription.visitId, select patientUserId) — queried TWICE, once in the notification block and again in the reminder block",
+        "User (findUnique by req.user.id, select displayName — the sending doctor's name for the notification text)",
+        "User (findUnique inside createNotification, select email+displayName, only because sendEmail:true)",
+        "Notification (create x1 or x2)",
+        "Reminder (deleteMany + create)",
+        "DeviceToken (findMany/deleteMany inside pushService)"
+      ],
+      "externalDeps": [
+        "server/src/services/notificationService.js -> createNotification (lazily required INSIDE the handler, twice)",
+        "server/src/services/emailService.js -> sendEmail (reached because sendEmail:true on the first notification)",
+        "server/src/services/pushService.js -> send (always attempted, silently swallowed)",
+        "server/src/utils/medicationScheduleUtils.js -> parseFrequency, getDefaultDoseTimes"
+      ],
+      "sideEffects": [
+        "Notification #1 (only when visit.patientUserId is truthy): {userId: <patient>, type:'PRESCRIPTION_SENT', title:'New Prescription Available', message:`Dr. ${docUser?.displayName || 'Your doctor'} has sent you a new prescription. View it in your Prescriptions page.`, data:{prescriptionId: <:id from the URL>}, sendEmail:true}",
+        "Email to the patient (subject = the notification title, html = `<h2>{title}</h2><p>{message}</p>`, text = `{title}\\n\\n{message}`), fired inside createNotification because sendEmail:true; failure is console.error'd only",
+        "Push notification to every DeviceToken of the patient: {title, body: message, data: {prescriptionId}} — always attempted, errors swallowed",
+        "Reminder purge: for EACH medication, deleteMany over reminders WHERE userId=<patient> AND type='MEDICATION' AND title CONTAINS drugName AND status='ACTIVE' — this is a SUBSTRING match, so it wipes that drug's ACTIVE reminders originating from ANY other prescription too",
+        "Reminder creation: for each dose time i (0-based) of each medication -> {userId:<patient>, createdById: req.user.id (the physician's USER id), title:`💊 ${drugName}${doseLabel}`, description:`${dosage ? dosage + ' — ' : ''}Take at ${timeStr}`, type:'MEDICATION', remindAt: <local Date>, recurrence:'DAILY', prescriptionId: <:id>, notes: JSON.stringify({drugName, dosage, frequency, doseNumber: i+1, totalDoses: dosesPerDay, intervalHours})}",
+        "Notification #2 (only when remindersCreated > 0): {userId:<patient>, type:'MEDICATION_REMINDER_SET', title:'Medication Reminders Set', message:`${n} medication reminder${n > 1 ? 's have' : ' has'} been automatically created from your new prescription.`, data:{prescriptionId}, sendEmail:false} — push is still attempted",
+        "logger.info({prescriptionId, remindersCreated}, '[Prescriptions] Auto-created medication reminders') — only inside the `patientUserId && medications.length > 0` branch",
+        "NO route cache invalidation."
+      ],
+      "quirks": [
+        "NO status precondition — the comment 'Auto-sign is now done at creation — no DRAFT block needed' documents the removal of the guard. You can /send a DRAFT (status becomes SENT while signedAt stays NULL), and you can re-send a DISPENSED prescription, REGRESSING its status from DISPENSED back to SENT.",
+        "Every re-send re-runs the full side-effect chain: another patient notification + email + push, another reminder purge, and a fresh set of reminder rows. There is no idempotency key and no check on sentToPatientAt.",
+        "signedAt is NOT set here — only status and sentToPatientAt change.",
+        "'Dr. ' is hardcoded in front of docUser.displayName, so a displayName already containing a title renders as 'Dr. Dr. Ahmed ...'.",
+        "The notification's data.prescriptionId uses the raw `id` from req.params, not updated.id — identical in practice, but note it is the URL string.",
+        "Visit is queried TWICE for the same patientUserId (once per side-effect block) — two round trips for one value.",
+        "The reminder block reads `prescription.medications` from the PRE-update snapshot, not from `updated`. Same value in practice since send does not touch medications.",
+        "A medication is skipped when `!med.frequency || !med.drugName` — so meds with an empty-string frequency produce no reminders and no purge, silently.",
+        "parseFrequency: 'every N h' -> round(24/N); '<n> times a day|daily|/day' -> n; 'three times|thrice|tid' -> 3; 'twice|two times|bid|2x' -> 2; 'four times|qid|4x' -> 4; 'once|one time|od|1x' -> 1; otherwise 1. Result is CLAMPED to 1..12 and intervalHours = Math.round(24/dosesPerDay). Regex order matters: the 'twice|...|b.i.d' branch is tested BEFORE 'four times|q.i.d', and 'three times|t.i.d' before both. The 'od' pattern is `o\\.?d` which also matches inside unrelated words.",
+        "getDefaultDoseTimes: 1->['08:00']; 2->['08:00','20:00']; 3->['08:00','14:00','20:00']; 4->['08:00','12:00','18:00','22:00']; 5+ -> evenly spaced from 08:00 with wraparound modulo 24h (so a 5-dose schedule wraps past midnight and reminder times are NOT in ascending order).",
+        "Dose times are computed with `new Date()` then setHours(h,m,0,0) in the SERVER's local timezone, not the patient's. If that local instant is already past, the date is bumped +1 day — so remindAt is 'today or tomorrow at the server's local h:m'.",
+        "doseLabel is '' when dosesPerDay === 1, otherwise ` (Dose ${i+1}/${dosesPerDay})` — note the leading space, and 1-based numbering.",
+        "timeStr = doseTime.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:true}) — yields e.g. '08:00 AM' (zero-padded 12-hour with a non-breaking-space-or-space before AM/PM depending on the ICU version; this is embedded in the reminder description, not in the HTTP response).",
+        "The reminder title starts with the 💊 emoji plus a space: `💊 Metformin (Dose 1/2)`. The purge matches on `contains: drugName`, a case-SENSITIVE substring on Postgres, so 'Metformin' will not purge a reminder titled with 'metformin', and a short drug name that is a substring of another drug's name will purge that other drug's reminders too.",
+        "The purge only targets status='ACTIVE' reminders, so COMPLETED/CANCELLED ones survive and can accumulate.",
+        "Reminder.createdById is the PHYSICIAN's user id while Reminder.userId is the patient's — and Reminder.patientUserId is left NULL even though the schema comment says it is 'set when physician creates for a patient'.",
+        "Reminder.notes is a JSON STRING (JSON.stringify output), not a Json column — it must be persisted as text with exactly those keys in that order: drugName, dosage, frequency, doseNumber, totalDoses, intervalHours.",
+        "`dosage` defaults to '' (`med.dosage || ''`), and the description then omits the ' — ' separator entirely when dosage is empty: 'Take at 08:00 AM' vs '500mg — Take at 08:00 AM' (em dash U+2014 surrounded by spaces).",
+        "Reminder creation is sequential and un-transactioned (an await inside a for inside a for). A mid-loop failure leaves the earlier reminders created, the purge already applied, the prescription already SENT, and returns 200 with no indication of the partial state.",
+        "remindersCreated is only computed inside `if (patientUserId && medications.length > 0)`, so the '[Prescriptions] Auto-created medication reminders' log line and Notification #2 never fire for an empty medications array.",
+        "No deletedAt filter — a soft-deleted prescription can be sent, notified about, and generate reminders.",
+        "The response carries NO information about the reminders or notification, so a .NET port can fail these side effects entirely and still produce byte-identical JSON — but the patient's reminders and inbox would silently differ.",
+        "Both notificationService requires are lazy `require(...)` calls inside the handler (twice), presumably to dodge a circular import.",
+        "No auditLog middleware on this route."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/dispense",
+      "nodeLines": "L446-L512",
+      "summary": "Marks the prescription DISPENSED and optionally decrements clinic inventory for a caller-supplied list of {itemId, quantity}. Each item gets an atomic decrement paired with an inventoryTransaction row in a $transaction; if the resulting stock is negative the decrement is rolled back (but the transaction row is NOT) and the item is omitted from the response.",
+      "auth": "router.use(authCheck) only. In-handler gate: physicianProfile must exist for req.user.id AND prescription.physicianId === that profile's id, else 403. NO ownership/clinic check on the inventory items at all. No auditLog, no userType check.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"visitId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"subprofileId\": \"uuid\" | null,\n  \"status\": \"DISPENSED\",                  // always the literal DISPENSED\n  \"medications\": <raw Json, unchanged>,\n  \"notes\": \"string\" | null,\n  \"signedAt\": \"ISO-8601\" | null,\n  \"sentToPatientAt\": \"ISO-8601\" | null,\n  \"pdfUrl\": \"string\" | null,\n  \"refillRequestedAt\": \"ISO-8601\" | null,\n  \"refillStatus\": \"string\" | null,\n  \"refillNotes\": \"string\" | null,\n  \"createdAt\": \"ISO-8601\",\n  \"updatedAt\": \"ISO-8601\",\n  \"deletedAt\": \"ISO-8601\" | null,\n  \"message\": \"Prescription dispensed\",\n  \"inventoryDeducted\": [                  // ALWAYS an array, [] when no items were supplied or all were skipped. NEVER null, never absent.\n    {\n      \"itemId\": \"uuid\",                   // echoed from the request, not re-read\n      \"name\": \"string\",                   // InventoryItem.name from the PRE-decrement read\n      \"quantity\": <int>,                  // parseInt(request quantity) — the POSITIVE number, even though the transaction row stores -qty\n      \"newStock\": <int>                   // the item's currentStock AFTER the atomic decrement\n    }\n  ]\n}\nThe two extra keys are appended by the spread, so `message` then `inventoryDeducted` serialize LAST, in that order. Flat otherwise — the update has no include.",
+      "errorCases": [
+        "404 {\"error\":\"Prescription not found\"} when no row has that id",
+        "403 {\"error\":\"Not your prescription\"} when the caller has no physicianProfile OR the prescription belongs to another physician",
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "500 {\"error\":\"Failed to dispense prescription\"} on any thrown error — INCLUDING a Prisma failure inside the inventory loop (e.g. a non-numeric quantity producing NaN, or a concurrent FK problem). The prescription has ALREADY been set to DISPENSED by then, so the client sees a 500 for a mutation that partially succeeded.",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the app-level /api limiter"
+      ],
+      "requestBody": [
+        "inventoryItems?: array of { itemId: string, quantity: number|string } — entirely OPTIONAL. Only processed when Array.isArray(inventoryItems) && length > 0; any non-array value (object, string, null, undefined) is silently ignored and inventoryDeducted comes back []. The client in PrescriptionsPage.jsx sends NO body at all.",
+        "(no other body fields are read)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "prescriptions — UPDATE SET status='DISPENSED', updatedAt=now() WHERE id=:id. NOT in a transaction, and it runs BEFORE any inventory work.",
+        "inventory_items — UPDATE currentStock = currentStock - qty (atomic decrement), inside prisma.$transaction, one transaction PER item",
+        "inventory_transactions — INSERT inside the SAME $transaction: {itemId, type:'DISPENSED', quantity: -qty, previousStock: <stale pre-read item.currentStock>, newStock: Math.max(0, item.currentStock - qty), prescriptionId: <:id>, notes:'Dispensed via prescription', performedById: req.user.id}",
+        "inventory_items — a COMPENSATING UPDATE currentStock = currentStock + qty (increment), OUTSIDE any transaction, when the post-decrement currentStock is negative"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "InventoryItem (findUnique by itemId, one per requested item — full row read before the decrement)",
+        "InventoryTransaction (write-only)"
+      ],
+      "externalDeps": [],
+      "sideEffects": [
+        "One inventory_transactions row of type DISPENSED per attempted item — INCLUDING items whose decrement is subsequently rolled back for insufficient stock.",
+        "Stock levels change on inventory_items. No notification, no audit row, no cache invalidation, no reminder work."
+      ],
+      "quirks": [
+        "NO status precondition. You can dispense a DRAFT or an already-DISPENSED prescription; each call re-runs the inventory deduction, so double-submitting double-deducts stock.",
+        "NO clinic/tenant scoping on itemId. `prisma.inventoryItem.findUnique({where:{id: itemId}})` accepts ANY inventory item id in the whole database — a physician can decrement another clinic's stock. A faithful port must reproduce this (or the client's behavior changes), but flag it.",
+        "ROLLBACK LEAK: when the post-decrement currentStock < 0, only the inventory_items row is incremented back — the inventory_transactions row created in the same $transaction is left in place. The DB ends up with an orphan DISPENSED row (negative quantity) for a deduction that never happened, and the item silently does NOT appear in inventoryDeducted. The client gets 200 with no hint that the item was skipped.",
+        "The compensating increment is a bare update OUTSIDE a transaction, so a crash between the two leaves stock permanently short.",
+        "previousStock and the transaction's newStock come from the STALE pre-read `item.currentStock`, while the item's real new value comes from the atomic decrement. Under concurrency the transaction row's newStock does NOT match the item's actual currentStock, and the response's `newStock` (from updatedItem) can differ from the row's newStock.",
+        "The transaction row's newStock is clamped with Math.max(0, ...) but the item's currentStock is NOT clamped — the item can genuinely go negative before the rollback check reads it.",
+        "`if (!itemId || !quantity) continue;` uses truthiness: quantity 0, '', null, undefined and false all skip the item silently. Skipped items produce no transaction row and no response entry.",
+        "quantity goes through parseInt(quantity) with no radix and no validation: '3.9' -> 3; '5abc' -> 5; 'abc' -> NaN, which reaches Prisma's decrement and THROWS -> 500 with the prescription already DISPENSED and any earlier items already deducted.",
+        "A NEGATIVE quantity (e.g. -5) passes the truthiness check and becomes `decrement: -5`, i.e. it INCREASES stock. The rollback check (< 0) does not fire, and the response reports {quantity: -5, newStock: <increased>} while the transaction row stores quantity: +5 (because it writes -qty).",
+        "`if (!item || !item.isActive) continue;` — a missing or soft-inactive item is silently skipped, no error, no response entry.",
+        "The $transaction destructures `const [updatedItem, tx] = ...` and `tx` is never used (dead variable).",
+        "One $transaction per item, not one for the whole batch, so a mid-batch failure leaves earlier items deducted.",
+        "inventoryDeducted is initialized to `let deducted = []` and always emitted — even when no inventoryItems were sent. It is an empty ARRAY, never null and never an omitted key. Elements are pushed in request order (minus skipped items).",
+        "The `name` in each element is InventoryItem.name from before the decrement — a response key that comes from a DIFFERENT model than everything else in the payload.",
+        "The response's element key is `itemId` (echoed from the request), not `id` — it does NOT match InventoryItem's primary-key field name.",
+        "The prescription status UPDATE is not part of any inventory transaction: a total inventory failure still leaves the prescription DISPENSED.",
+        "No deletedAt filter — a soft-deleted prescription can be dispensed.",
+        "`message` ('Prescription dispensed') and `inventoryDeducted` are appended after all the model scalars via the object spread, in that exact order.",
+        "No auditLog middleware, even though this mutates inventory."
+      ]
+    }
+  ]
+}

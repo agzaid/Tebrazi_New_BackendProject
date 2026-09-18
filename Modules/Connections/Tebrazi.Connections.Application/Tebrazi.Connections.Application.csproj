@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Tebrazi.Connections.Domain\Tebrazi.Connections.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- GET /api/connections/qr-code only. See Services/ConnQrCodeRenderer.cs. -->
+    <PackageReference Include="QRCoder" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

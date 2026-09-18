@@ -1,0 +1,326 @@
+{
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/",
+      "nodeLines": "L430-L505",
+      "summary": "Patient self-books an appointment. Resolves the PhysicianProfile from the body's physicianUserId, rejects an exact same-day same-startTime collision for that physician, creates the Appointment as PENDING with patientUserId = the CALLER, then fires a best-effort notification + email to the physician. Returns the created row with clinic.name, physician.user.displayName and subprofile.",
+      "auth": "router.use(authCheck) at L19 — JWT Bearer only (jwt.verify of process.env.JWT_SECRET, no DB lookup). NO aiUsageCheck, NO auditLog anywhere in this router. NO in-handler userType or ownership gate: any authenticated user (patient, physician, staff, manager) may call this and it books THEM as the patient. clinicId ownership and clinic.allowPatientBooking are never checked here.",
+      "successStatus": 201,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"clinicId\": \"uuid\",\n  \"physicianId\": \"uuid\",          // PhysicianProfile.id, NOT the physicianUserId that was sent\n  \"patientUserId\": \"uuid\",          // always req.user.id\n  \"subprofileId\": \"uuid\" | null,\n  \"clinicPatientId\": null,          // never set by this handler\n  \"status\": \"PENDING\",\n  \"appointmentDate\": \"2026-03-10T00:00:00.000Z\",   // ISO-8601 UTC string w/ ms; from new Date(body.appointmentDate)\n  \"startTime\": \"09:00\",             // plain string, NOT a date\n  \"endTime\": \"09:30\",               // plain string\n  \"reason\": \"string\" | null,\n  \"notes\": null,\n  \"appointmentType\": \"IN_PERSON\",   // enum IN_PERSON|VIDEO|PHONE|WALK_IN, echoed from body\n  \"confirmedAt\": null,\n  \"completedAt\": null,\n  \"cancelledAt\": null,\n  \"cancelReason\": null,\n  \"recurringRule\": null,\n  \"recurringGroupId\": null,\n  \"createdAt\": \"2026-09-03T10:22:41.512Z\",\n  \"updatedAt\": \"2026-09-03T10:22:41.512Z\",\n  \"deletedAt\": null,\n  \"clinic\": { \"name\": \"Nile Clinic\" },              // ONLY name — no id/address/phone (GET / returns those)\n  \"physician\": { \"user\": { \"displayName\": \"Dr. Ahmed\" } },  // no physician id, no specialty\n  \"subprofile\": null | { \"name\": \"Noor\", \"relation\": \"CHILD\" }  // enum SELF|SPOUSE|CHILD|PARENT|SIBLING|OTHER; null (present, not omitted) when no subprofile\n}",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing or not starting with 'Bearer '",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws (bad signature, expired)",
+        "400 {\"error\":\"All booking fields are required\"} when ANY of clinicId, physicianUserId, appointmentDate, startTime, endTime is falsy (empty string counts as missing)",
+        "400 {\"error\":\"Physician not found\"} when no PhysicianProfile exists for body.physicianUserId — note 400, NOT 404",
+        "409 {\"error\":\"This slot is already booked\"} when a PENDING/CONFIRMED appointment for that PhysicianProfile exists on the same local day with the identical startTime string",
+        "500 {\"error\":\"Failed to book appointment\"} on any thrown error: nonexistent clinicId (FK violation), nonexistent subprofileId (FK violation), unparseable appointmentDate (Invalid Date), appointmentType not in the AppointmentType enum",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter (100 req/min per IP, standardHeaders on)"
+      ],
+      "requestBody": [
+        "clinicId: string — REQUIRED",
+        "physicianUserId: string (User.id of the doctor, not the profile id) — REQUIRED",
+        "appointmentDate: string 'YYYY-MM-DD' (what the client sends) — REQUIRED",
+        "startTime: string 'HH:MM' — REQUIRED",
+        "endTime: string 'HH:MM' — REQUIRED",
+        "reason: string — optional; '' is coerced to null",
+        "appointmentType: string — optional; defaults to 'IN_PERSON'; NOT validated",
+        "subprofileId: string — optional; '' or undefined coerced to null; NOT verified to belong to the caller"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "appointments — 1 INSERT, NOT in a transaction",
+        "notifications — 1 INSERT via notificationService.createNotification, best-effort inside its own try/catch, NOT in a transaction"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "Clinic (read via prisma include, select name)",
+        "FamilySubprofile (read via prisma include, select name+relation)",
+        "User (findUnique of the caller for displayName, used only in the notification text)",
+        "User (again, inside notificationService, select email+displayName for the email dispatch)",
+        "Notification (write)",
+        "DeviceToken (read inside pushService.send)"
+      ],
+      "sideEffects": [
+        "Notification row for the physician: type 'NEW_APPOINTMENT_REQUEST', title 'New Appointment Request', message `${patientDisplayName||'A patient'}${subprofile? ' (for '+name+')':''} booked an appointment on ${toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})} at ${startTime}${reason? ' — '+reason:''}.`",
+        "Transactional EMAIL to the physician (sendEmail: true) — awaited synchronously inside the request; subject = title, html = `<h2>${title}</h2><p>${message}</p>`",
+        "FCM push attempt to the physician (pushService.send is always tried by createNotification, errors swallowed)",
+        "NO cache invalidation — GET / and GET /today are cacheMiddleware(15) and keep serving the pre-booking list for up to 15s for that same user"
+      ],
+      "externalDeps": [
+        "services/notificationService (lazily required inside the handler)",
+        "services/emailService (via notificationService, sendEmail: true)",
+        "services/pushService (via notificationService, always attempted)",
+        "lib/cacheMiddleware — NOT used on this route, but its stale window is a consequence of this write"
+      ],
+      "quirks": [
+        "Books for the CALLER, not for a named patient: data.patientUserId = req.user.id. The body has no patient field at all, so a physician or receptionist hitting POST / creates an appointment with THEMSELVES as the patient.",
+        "Missing physician profile returns 400, not 404, with the message 'Physician not found'.",
+        "clinicId is NEVER validated — not checked to exist, not checked to belong to the physician, and clinic.allowPatientBooking is NOT enforced here (only GET /available honors it). A patient can book at a booking-disabled clinic by POSTing directly.",
+        "No TimeSlot validation whatsoever: any startTime/endTime string is accepted, including out-of-hours values and non-time garbage ('banana' is stored verbatim).",
+        "The conflict query omits clinicId, so it spans ALL of that physician's clinics — the physician cannot be double-booked across two clinics at the same minute.",
+        "The conflict query ignores endTime and any overlap logic: only an EXACTLY equal startTime string collides. 09:00-10:00 and 09:30-10:30 both succeed.",
+        "The day window is built as new Date(appointmentDate) then LOCAL setHours(0,0,0,0)/setHours(23,59,59,999). V8 parses 'YYYY-MM-DD' as UTC midnight, so on a UTC-negative host the window covers the PREVIOUS local day and the collision check silently looks at the wrong day.",
+        "appointmentDate is stored as the UTC-midnight instant of the 'YYYY-MM-DD' string, and it serializes back as '...T00:00:00.000Z'. Compare POST /walk-in, which parses the same input as LOCAL 12:00 — the two endpoints store different instants for the same date string.",
+        "findFirst-then-create is not atomic and there is no unique index, so two concurrent bookings for the same slot both return 201.",
+        "CANCELLED / COMPLETED / NO_SHOW appointments do not block a rebooking (status filter is only ['PENDING','CONFIRMED']).",
+        "appointmentType comes straight from the body with no whitelist; a value outside the enum makes Prisma throw and the client sees 500 'Failed to book appointment', not a 400.",
+        "reason: '' becomes null (|| null), so an empty reason is indistinguishable from no reason.",
+        "subprofileId is not checked against the caller's own PatientProfile — any known subprofile UUID is accepted (only the FK guards existence).",
+        "Notification type is the string 'NEW_APPOINTMENT_REQUEST', which is NOT in notificationService.NOTIFICATION_TYPES (that list contains 'APPOINTMENT_BOOKED'). Notification.type is a plain String column so it persists unvalidated; any client-side switch on the documented type list will not match it.",
+        "The entire notification+email block is wrapped in its own try/catch that only logs — a dead SMTP server or missing physician still returns 201 and the response says nothing about it.",
+        "The notification date string is produced by toLocaleDateString('en-US', …) in the SERVER's timezone from a UTC-midnight Date, so it can name the previous day on UTC-negative hosts.",
+        "The notification is addressed to body.physicianUserId (a User.id) while the appointment stores physician.id (a profile id) — two different identifiers in one flow.",
+        "The response's clinic object has ONLY { name }. GET /api/appointments returns clinic { id, name, address, phone } for the same rows, so the client sees a narrower clinic here.",
+        "The response has NO patientUser key, while GET / and GET /today add patientUser: { id, displayName, phone } | null. A client reusing one renderer must tolerate its absence.",
+        "subprofile is emitted as null (key present) rather than omitted when there is no family member.",
+        "Every string in req.body was already mutated by the global XSS sanitizer in server/src/index.js L56-L81 before this handler ran: <script>…</script> and a tag blacklist are stripped, /\\bon\\w+\\s*=…/ handlers are stripped, the substrings 'javascript:', 'data:' and 'vbscript:' are removed ANYWHERE in the string (so a reason of 'data: 5mg' is stored as ' 5mg'), 'expression(' is removed, and 'url(' is rewritten to 'url\\('. A faithful port must replicate this or stored reason text differs.",
+        "deletedAt is always present and always null: this router never writes it and never filters on it, so the soft-delete column is decorative."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/recurring",
+      "nodeLines": "L700-L735",
+      "summary": "Creates a series of up to 12 appointments spaced by a fixed day interval derived from `rule`, all sharing a generated recurringGroupId, with patientUserId = the CALLER. Sequential un-transacted inserts, no conflict checking, no notification. Returns { count, groupId, appointments: [...] }.",
+      "auth": "router.use(authCheck) at L19 — JWT Bearer only. No aiUsageCheck, no auditLog. NO in-handler gate at all: no userType check, no clinic ownership check, no staff check, no allowPatientBooking check. Any authenticated user can create a 12-deep series against any physicianUserId and any clinicId.",
+      "successStatus": 201,
+      "responseShape": "{\n  \"count\": 4,                       // created.length — the ACTUAL rows inserted, not the requested count\n  \"groupId\": \"uuid\",                // response key differs from the model field, which is recurringGroupId\n  \"appointments\": [                 // ordered oldest-first; CAN BE AN EMPTY ARRAY (never null) — see quirks\n    {\n      \"id\": \"uuid\",\n      \"clinicId\": \"uuid\",\n      \"physicianId\": \"uuid\",\n      \"patientUserId\": \"uuid\",      // always req.user.id\n      \"subprofileId\": null,          // not settable on this route\n      \"clinicPatientId\": null,\n      \"status\": \"PENDING\",\n      \"appointmentDate\": \"2026-03-10T00:00:00.000Z\",\n      \"startTime\": \"09:00\",\n      \"endTime\": \"09:30\",\n      \"reason\": \"string\" | null,\n      \"notes\": null,\n      \"appointmentType\": \"IN_PERSON\",   // not settable on this route; schema default\n      \"confirmedAt\": null,\n      \"completedAt\": null,\n      \"cancelledAt\": null,\n      \"cancelReason\": null,\n      \"recurringRule\": \"WEEKLY\",        // stored VERBATIM from the body, unvalidated\n      \"recurringGroupId\": \"uuid\",       // same value as the top-level groupId\n      \"createdAt\": \"2026-09-03T10:22:41.512Z\",\n      \"updatedAt\": \"2026-09-03T10:22:41.512Z\",\n      \"deletedAt\": null\n    }\n  ]\n}\n// NOTE: no include — the array elements have NO clinic, NO physician, NO subprofile, NO patientUser keys, unlike POST /.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "400 {\"error\":\"All fields required\"} when ANY of clinicId, physicianUserId, startDate, startTime, endTime, rule is falsy (`count` is NOT required)",
+        "400 {\"error\":\"Physician not found\"} when no PhysicianProfile exists for body.physicianUserId — 400, not 404",
+        "500 {\"error\":\"Failed to create recurring appointments\"} on a thrown error mid-loop (bad clinicId FK, unparseable startDate) — earlier occurrences in the series are ALREADY COMMITTED and are not rolled back",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter"
+      ],
+      "requestBody": [
+        "clinicId: string — REQUIRED",
+        "physicianUserId: string (User.id) — REQUIRED",
+        "startDate: string 'YYYY-MM-DD' — REQUIRED",
+        "startTime: string 'HH:MM' — REQUIRED",
+        "endTime: string 'HH:MM' — REQUIRED",
+        "rule: string — REQUIRED; only 'WEEKLY' and 'BIWEEKLY' are recognized, everything else falls through to a 30-day interval",
+        "reason: string — optional; '' coerced to null",
+        "count: number — optional; Math.min(count || 4, 12)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "appointments — N sequential individual INSERTs in a for-loop, explicitly NOT wrapped in prisma.$transaction; a failure at iteration k leaves iterations 0..k-1 committed"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)"
+      ],
+      "sideEffects": [
+        "NONE — no notification, no email, no push, no audit row, no cache invalidation. This is the only create route here that notifies nobody.",
+        "GET / and GET /today (cacheMiddleware(15)) can stay stale for up to 15s after the series is created"
+      ],
+      "externalDeps": [
+        "node:crypto (require('crypto').randomUUID() called lazily inside the handler for groupId)"
+      ],
+      "quirks": [
+        "Books for the CALLER: patientUserId = req.user.id. body.physicianUserId is the doctor; there is no way to create a series on behalf of a patient.",
+        "count is clamped on the HIGH side only: Math.min(count || 4, 12). count: 0 → falsy → 4. count: -3 → Math.min(-3,12) = -3 → the loop body never runs → **201 with {count: 0, groupId: '<uuid>', appointments: []}** and a groupId that belongs to nothing. A non-numeric count → NaN → 0 < NaN is false → same empty 201. count: 100 → 12.",
+        "`appointments` can therefore be an EMPTY ARRAY on a 201 — never null, but a client that assumes at least one row will break.",
+        "intervalDays = rule === 'WEEKLY' ? 7 : rule === 'BIWEEKLY' ? 14 : 30. 'MONTHLY', 'DAILY', 'YEARLY', lowercase 'weekly', and outright typos ALL silently become 30-day spacing, while recurringRule stores the unrecognized string verbatim — the persisted rule and the actual spacing disagree.",
+        "'MONTHLY' is 30 calendar days, not a calendar month, so a Jan 31 start lands on Mar 2, Apr 1, May 1 — the day-of-month drifts.",
+        "ZERO conflict checking. Unlike POST /, there is no 409 path: the series can stack on top of existing PENDING/CONFIRMED appointments, on other patients' bookings, and on itself.",
+        "NOT transactional. Sequential prisma.appointment.create calls in a plain for-loop, so a mid-series failure returns 500 while leaving orphaned committed occurrences the client never learns the ids of.",
+        "No notification of any kind is sent — the physician is never told a 12-appointment series was booked against their calendar. Inconsistent with POST /, /confirm and /cancel.",
+        "subprofileId is not read from the body → always null. A recurring series cannot be booked for a family member.",
+        "appointmentType is not read from the body → always the IN_PERSON schema default; notes always null.",
+        "The response key is `groupId` while the column is `recurringGroupId` — the same value appears under two different names in one payload.",
+        "`count` in the response is created.length, the actual insert count, not the requested/clamped count. They diverge only in the negative/NaN case described above (where both happen to be 0) but a port must return the array length, not the clamp result.",
+        "Date math is JS-Date-specific: `const date = new Date(startDate)` is RE-parsed from the original string on every iteration (so no compounding drift), then `date.setDate(date.getDate() + (i * intervalDays))` mutates using LOCAL date components on a UTC-midnight instant. On a UTC-negative host getDate() returns the previous day, and a DST boundary inside the series shifts the stored UTC instant by ±1 hour relative to occurrence 0. Occurrence k is therefore NOT simply start + k*interval in UTC — a .NET port using UTC DateTime arithmetic will produce different appointmentDate values.",
+        "The 400 message is the bare 'All fields required' — shorter and different from POST /'s 'All booking fields are required'. Two near-identical validations with two different strings.",
+        "clinicId is never validated against the physician or for existence — an invalid one surfaces as 500, not 400/403.",
+        "Same global XSS sanitizer applies to `reason` before the handler runs (see server/src/index.js L56-L81)."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/walk-in",
+      "nodeLines": "L556-L695",
+      "summary": "Creates an immediately-CONFIRMED WALK_IN appointment for a named patient, resolving the physician either from the caller's own PhysicianProfile or (staff path) from the clinic's physicianId. Then runs two independent best-effort blocks: notify the physician, and auto-insert the patient into today's waitingQueue with the next queue number. Returns only the appointment plus clinic.name.",
+      "auth": "router.use(authCheck) at L19 — JWT Bearer only. No aiUsageCheck, no auditLog. In-handler gate: if the caller has ANY PhysicianProfile they are accepted unconditionally (physicianId = their own profile, no clinic ownership check); otherwise an ACTIVE ClinicStaff row for that exact clinicId is required, else 403. ClinicStaff.role and ClinicStaff.permissions are never consulted.",
+      "successStatus": 201,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"clinicId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"patientUserId\": \"uuid\",          // straight from the body, NOT FK-validated\n  \"subprofileId\": \"uuid\" | null,\n  \"clinicPatientId\": null,\n  \"status\": \"CONFIRMED\",            // hard-coded, walk-ins skip PENDING\n  \"appointmentDate\": \"2026-09-03T09:00:00.000Z\",  // = new Date(body.appointmentDate + 'T12:00:00') i.e. server-LOCAL noon; or `now` (full timestamp incl. time-of-day) when appointmentDate is absent\n  \"startTime\": \"14:35\",             // body.startTime, else server-local HH:MM of now\n  \"endTime\": \"14:35\",               // body.endTime, else EQUAL to startTime (zero-length appointment)\n  \"reason\": \"Walk-in\",              // body.reason, else the literal string 'Walk-in' — never null\n  \"notes\": \"WALK_IN\",               // hard-coded literal\n  \"appointmentType\": \"WALK_IN\",     // hard-coded\n  \"confirmedAt\": \"2026-09-03T11:35:02.881Z\",  // = now\n  \"completedAt\": null,\n  \"cancelledAt\": null,\n  \"cancelReason\": null,\n  \"recurringRule\": null,\n  \"recurringGroupId\": null,\n  \"createdAt\": \"2026-09-03T11:35:02.881Z\",\n  \"updatedAt\": \"2026-09-03T11:35:02.881Z\",\n  \"deletedAt\": null,\n  \"clinic\": { \"name\": \"Nile Clinic\" }   // ONLY include on this route\n}\n// physician, subprofile, patientUser, the created waitingQueue row, and the queueNumber are ALL ABSENT (keys not present, not null).",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "400 {\"error\":\"clinicId and patientUserId are required\"} when either is falsy",
+        "403 {\"error\":\"Not authorized\"} when the caller has no PhysicianProfile AND no active ClinicStaff row for that clinicId",
+        "404 {\"error\":\"Clinic not found\"} — reachable ONLY on the staff path (a physician caller never gets this; a bad clinicId becomes a 500 for them)",
+        "500 {\"error\":\"Failed to create walk-in\"} on a thrown error: nonexistent clinicId (FK violation on the physician path), nonexistent subprofileId (FK violation), or an Invalid Date from appointmentDate + 'T12:00:00' when the client sends anything other than 'YYYY-MM-DD'",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter"
+      ],
+      "requestBody": [
+        "clinicId: string — REQUIRED",
+        "patientUserId: string — REQUIRED; NOT FK-constrained and NOT validated",
+        "reason: string — optional; defaults to the literal 'Walk-in'",
+        "appointmentDate: string 'YYYY-MM-DD' — optional; defaults to `now`",
+        "startTime: string 'HH:MM' — optional; defaults to server-local HH:MM of now",
+        "endTime: string 'HH:MM' — optional; defaults to resolvedStart (equal to startTime)",
+        "subprofileId: string — optional; '' (the client's empty form field) coerced to null"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "appointments — 1 INSERT, NOT in a transaction",
+        "notifications — 1 conditional INSERT via notificationService, best-effort try/catch",
+        "waiting_queues — 1 conditional INSERT (auto-check-in), best-effort try/catch, NOT transactional and NOT atomic with the queueNumber read"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId; then findUnique by id twice more — once for the notification, once for the queue row)",
+        "ClinicStaff (findFirst, staff path only)",
+        "Clinic (findUnique select physicianId, staff path only; plus Clinic read via the include for name)",
+        "User (findUnique select displayName — twice: once for the notification, once for the queue patientName)",
+        "FamilySubprofile (findUnique select name, only when subprofileId is present)",
+        "WaitingQueue (findFirst for an existing WAITING/BEING_SEEN row; findFirst orderBy queueNumber desc for the next number; then create)",
+        "Notification (write)",
+        "DeviceToken (read inside pushService.send)"
+      ],
+      "sideEffects": [
+        "Notification to the physician ONLY when physicianProfile.userId !== req.user.id: type 'PATIENT_ARRIVED', title 'Walk-in Patient', message `${displayName||'A patient'} has been added as a walk-in at ${appointment.clinic?.name || 'your clinic'}`. sendEmail is NOT passed → no email. Failures are logger.warn only.",
+        "Auto-check-in: a waiting_queues row with source 'APPOINTMENT' (not 'WALK_IN'), status defaulting to 'WAITING', queueNumber = (max for that clinic TODAY) + 1, queueDate = TODAY's local midnight, appointmentId = the new appointment id, reason = reason || 'Walk-in', patientName = subprofile name || user.displayName || 'Patient', subprofileName = the subprofile name or null, physicianUserId = physicianProfile?.userId || req.user.id. Skipped entirely if the patient already has a WAITING/BEING_SEEN row for that clinic today. Failures are logger.warn only.",
+        "logger.info('[WalkIn] Auto-checked-in patient <id> as #<n>') on a successful queue insert",
+        "FCM push attempt via pushService (only when the notification block runs)",
+        "NO cache invalidation — GET / and GET /today stay stale for up to 15s"
+      ],
+      "externalDeps": [
+        "services/notificationService (lazily required)",
+        "services/pushService (via notificationService)",
+        "services/emailService is NOT reached here (sendEmail omitted → false)"
+      ],
+      "quirks": [
+        "The physician branch takes precedence and performs NO ownership check: if the caller has any PhysicianProfile, physicianId = THEIR OWN profile id regardless of which clinicId was passed. A physician can create a walk-in in another physician's clinic and it is attributed to themselves. clinicId existence is enforced only by the FK, so on this branch a bad clinic yields 500, never 404.",
+        "404 'Clinic not found' is unreachable for a physician caller — the same bad input produces 403/404/500 depending on WHO calls.",
+        "patientUserId has NO Prisma relation on Appointment (plain String column, no FK) and is never validated. Any arbitrary string is accepted and stored; the appointment then renders with a null patient everywhere downstream.",
+        "Date parsing differs from POST /: `new Date(appointmentDate + 'T12:00:00')` is server-LOCAL noon, whereas POST / uses `new Date(appointmentDate)` = UTC midnight. The two endpoints persist DIFFERENT instants for the identical 'YYYY-MM-DD' input. A port must keep both behaviours distinct.",
+        "If the client ever sends a full ISO timestamp instead of 'YYYY-MM-DD', the string concatenation produces an unparseable value → Invalid Date → Prisma throws → 500, not a 400.",
+        "When appointmentDate is omitted, appointmentDate is set to `now` — a full timestamp with a real time-of-day, not a normalized midnight/noon. Walk-in rows are therefore inconsistent with every other appointment row's date normalization.",
+        "endTime defaults to resolvedStart, producing a ZERO-LENGTH appointment where endTime === startTime.",
+        "Mixed-source date/time: supplying appointmentDate but not startTime takes the DATE from the body and the TIME from server-local `now`, with no consistency check — a walk-in dated next Tuesday gets today's clock time.",
+        "reason is never null on this route — it defaults to the literal string 'Walk-in'. Client code that tests `reason == null` will never see it.",
+        "notes is hard-set to the literal 'WALK_IN'. GET /queue detects check-in by `notes?.includes('CHECKIN:')`, so a walk-in reads as NOT checked in even though it was auto-queued.",
+        "status 'CONFIRMED' and confirmedAt = now are set on creation — walk-ins never pass through PENDING, so no /confirm step exists for them.",
+        "NO duplicate or slot-conflict check at all (unlike POST /'s 409). The same patient can be walked in repeatedly at the same minute; each call creates another appointment.",
+        "The notification is suppressed when the physician adds their own walk-in (physicianProfile.userId === req.user.id) — a silent no-op that is not reflected in the response.",
+        "The auto-check-in uses TODAY's local midnight for queueDate, NOT resolvedDate. A walk-in dated in the future is still queued for today, so appointmentDate and queueDate disagree.",
+        "waiting_queues.source is set to 'APPOINTMENT', not 'WALK_IN', contradicting both the route name and the column's own schema default of 'WALK_IN'.",
+        "queueNumber is computed by a separate findFirst(orderBy queueNumber desc) and then incremented outside any transaction → duplicate queue numbers under concurrency. It also scans ALL statuses for that clinic+day (including COMPLETED and CANCELLED), so numbers are never reused and monotonically grow.",
+        "If the patient already has a WAITING or BEING_SEEN row for that clinic today, the appointment is still created but NO new queue row is added — the 201 body is identical either way and gives the client no way to tell.",
+        "subprofileName on the queue row is populated only when the FamilySubprofile lookup actually returns a row; if subprofileId was stored on the appointment but the row is missing, subprofileName stays null while patientName silently falls back to the account holder's displayName.",
+        "waiting_queues.physicianUserId falls back to req.user.id when the PhysicianProfile lookup returns nothing — a staff member's own id can end up in the physician column.",
+        "BOTH post-create blocks (notification and auto-check-in) are wrapped in try/catch → logger.warn. A completely failed check-in still returns 201 with a body that looks like a success, and the client (AssistantDashboardPage) has to re-fetch /queue to discover the truth.",
+        "The 201 body carries ONLY the appointment + clinic.name. It does NOT include the queue row, the assigned queueNumber, the physician, the subprofile, or the patient — physician/subprofile/patientUser keys are ABSENT (not null), unlike POST /'s response.",
+        "This route ignores the X-Clinic-Id header entirely (only GET / reads it) — clinicId must be in the body.",
+        "Same global XSS sanitizer applies to reason before the handler runs (server/src/index.js L56-L81).",
+        "The client (client/src/pages/AppointmentsPage.jsx L436) POSTs the whole walkInForm object including subprofileId: '' — the '' → null coercion is load-bearing."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/:id/intake-note",
+      "nodeLines": "L1126-L1203",
+      "summary": "Staff or physician writes a pre-visit intake note. Looks the appointment up only to derive the physician's userId and the patient's userId, then CREATES (never really updates — see quirks) a PatientNote whose content is prefixed '[INTAKE by <callerUserId>]', and notifies the physician when the writer is not the physician. Returns the PatientNote row spread with a message key, at status 200.",
+      "auth": "router.use(authCheck) at L19 — JWT Bearer only. No aiUsageCheck, no auditLog. In-handler gate: physician-owner of the appointment (PhysicianProfile.id === appt.physicianId) OR any ACTIVE ClinicStaff row at appt.clinicId, else 403. The docblock claims 'clinic staff with canDraftNotes' but permissions.canDraftNotes is NEVER read. There is NO validateConnection check (unlike PUT /api/patient-notes/:patientUserId).",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",                    // PatientNote.id\n  \"physicianUserId\": \"uuid\",        // isPhysician ? req.user.id : appt.physician.user.id\n  \"patientUserId\": \"uuid\",          // appt.patientUserId\n  \"subprofileId\": null,             // ALWAYS null — never copied from appt.subprofileId\n  \"clinicPatientId\": null,          // never set\n  \"content\": \"[INTAKE by 3f2a1c88-…-9d41]\\nPatient reports chest pain for 3 days\",  // literal author UUID, then \\n, then note.trim()\n  \"isPinned\": false,\n  \"createdAt\": \"2026-09-03T11:41:07.204Z\",\n  \"updatedAt\": \"2026-09-03T11:41:07.204Z\",\n  \"message\": \"Intake note saved\"    // appended by the handler, NOT a model field\n}\n// No appointmentId, no patient name, no physician object — the note is not linked to the appointment at all.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "400 {\"error\":\"Note content required\"} when note is undefined/null/'' or whitespace-only (guard is `!note?.trim()`)",
+        "404 {\"error\":\"Appointment not found\"} when no Appointment matches :id",
+        "403 {\"error\":\"Not authorized to write intake notes\"} when the caller is neither the owning physician nor active staff at appt.clinicId — note the LONGER message, unlike the bare 'Not authorized' used elsewhere in this file",
+        "500 {\"error\":\"Failed to save intake note\"} on any throw — most importantly the Prisma P2002 unique-constraint violation on PatientNote @@unique([physicianUserId, patientUserId, subprofileId]) that fires on the SECOND intake note for the same physician+patient (or the FIRST, if /api/patient-notes already created that row)",
+        "500 {\"error\":\"Failed to save intake note\"} when `note` is a non-string (number, object, array): `note?.trim` is undefined, calling it throws TypeError, and the outer catch converts it to a 500 instead of the intended 400",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter"
+      ],
+      "requestBody": [
+        "note: string — REQUIRED, must be non-empty after .trim(); no maximum length is enforced here"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "patient_notes — 1 INSERT (the UPDATE branch is dead code, see quirks), NOT in a transaction",
+        "notifications — 1 conditional INSERT via notificationService, best-effort try/catch"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId; plus the full PhysicianProfile row + nested User via the appointment's include)",
+        "User (nested select id via the appointment include; plus findUnique select displayName for the notification text)",
+        "ClinicStaff (findFirst, only when the caller is not the owning physician)",
+        "PatientNote (findFirst with content startsWith filter; then create or update)",
+        "Notification (write)",
+        "DeviceToken (read inside pushService.send)"
+      ],
+      "sideEffects": [
+        "Notification to the physician, ONLY when the writer is not the physician: type 'INTAKE_NOTE_READY', title 'Intake Note Ready', message `Pre-visit intake note written for ${displayName||'patient'} (${appt.startTime})`, data { appointmentId, noteId, patientUserId }. sendEmail not passed → no email. Failures are logger.warn only.",
+        "FCM push attempt via pushService",
+        "Mutates a PatientNote row that /api/patient-notes also owns — the two routes fight over the same unique key"
+      ],
+      "externalDeps": [
+        "services/notificationService (lazily required)",
+        "services/pushService (via notificationService)"
+      ],
+      "quirks": [
+        "Returns 200 even when it CREATES the note — never 201. A port that follows REST convention here breaks the contract.",
+        "The 400 guard `!note?.trim()` only protects against nullish and empty strings. A NON-STRING note (e.g. 123, {}, []) makes `note?.trim` undefined, the call throws TypeError, and the client receives 500 'Failed to save intake note' instead of the 400 the guard was meant to produce.",
+        "THE DEDUPE LOOKUP IS BROKEN AND THE UPDATE BRANCH IS DEAD CODE. The handler searches `content: { startsWith: '[INTAKE]' }` (L1161) but writes `` `[INTAKE by ${userId}]\\n…` `` (L1156). '[INTAKE by …]' does not start with the literal '[INTAKE]', and grepping the whole repo shows nothing ever writes '[INTAKE]'. Every call therefore takes the create path.",
+        "CONSEQUENCE: PatientNote carries @@unique([physicianUserId, patientUserId, subprofileId]) and this route always writes subprofileId = null, so the SECOND intake note for the same physician+patient raises P2002 and the client gets 500 'Failed to save intake note'. It also collides with a note already created by PUT /api/patient-notes/:patientUserId (which upserts on the very same key with subprofileId: null), so even the FIRST intake note can 500. This is the highest-value quirk on this endpoint — a port that 'fixes' it into a real upsert changes observable behaviour.",
+        "Conversely, /api/patient-notes' upsert (server/src/routes/patientNotes.js L99) writes to the SAME row and silently overwrites the '[INTAKE by …]' content — the intake draft can vanish without a trace.",
+        "No length cap here, while /api/patient-notes rejects content > 5000 chars with 400. An intake note can exceed 5000 chars and then be un-editable through the other route.",
+        "subprofileId is never copied from appt.subprofileId → always null. An intake note for a child's appointment is filed under the ACCOUNT HOLDER, not the family member, and is therefore indistinguishable from the account holder's own note.",
+        "clinicPatientId is never set even though the model supports it and the appointment could be tied to a ClinicPatient.",
+        "The content embeds the raw author UUID, not a display name: '[INTAKE by 3f2a1c88-…]'. The client renders this string verbatim.",
+        "The docblock's 'clinic staff with canDraftNotes' permission is never checked — ANY active ClinicStaff row at appt.clinicId can write clinical notes.",
+        "No connection validation: unlike /api/patient-notes (which calls validateConnection and 403s with 'Not connected to this patient'), this route lets clinic staff write notes about a patient the physician has no connection to.",
+        "The 403 message is 'Not authorized to write intake notes' — different from the bare 'Not authorized' used by /confirm, /cancel, /complete, /no-show and DELETE /:id in the same file.",
+        "physicianUserId is derived as `isPhysician ? req.user.id : appt.physician.user.id`. Both branches resolve to the same value in practice (isPhysician requires appt.physicianId === physician.id), so the ternary is redundant but must be preserved because a future data inconsistency would diverge.",
+        "The notification is skipped entirely when the physician writes their own note (`if (!isPhysician)`), and the whole block is try/catch → logger.warn, so the 200 says nothing about whether anyone was told.",
+        "The :id path param is used ONLY to look up the appointment and derive patient/physician. The note is NOT linked to the appointment in any column — two different appointments for the same patient share the single PatientNote row, and the response contains no appointmentId.",
+        "Route order: POST /walk-in (L556) and POST /recurring (L700) are registered before this two-segment route, so there is no shadowing; but any :id value is accepted (Appointment.id is a text column, not @db.Uuid, so a non-UUID id simply misses and returns 404 rather than a cast error).",
+        "The note string was already mutated by the global XSS sanitizer (server/src/index.js L56-L81) before .trim() ran: tag blacklist stripped, on*= handlers stripped, 'javascript:'/'data:'/'vbscript:' removed anywhere in the text (clinically relevant for a note mentioning 'data:'), 'expression(' removed, and 'url(' rewritten to 'url\\('."
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/:id",
+      "nodeLines": "L928-L956",
+      "summary": "Permanently HARD-deletes an appointment row. Allows the owning physician, the patient themselves, or any active clinic staff at the appointment's clinic. No status restriction, no notification, no dependent cleanup. Returns a bare message object.",
+      "auth": "router.use(authCheck) at L19 — JWT Bearer only. No aiUsageCheck, no auditLog. In-handler gate: isPhysician (PhysicianProfile.id === appt.physicianId) OR isPatient (appt.patientUserId === req.user.id) OR an ACTIVE ClinicStaff row at appt.clinicId (queried ONLY when the first two are false), else 403.",
+      "successStatus": 200,
+      "responseShape": "{ \"message\": \"Appointment deleted\" }\n// That is the entire body. No id, no deletedCount, no echo of the removed row, no `success` flag.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "404 {\"error\":\"Appointment not found\"} when no Appointment matches :id — this is ALSO what `DELETE /api/appointments/slots` (no slot id) returns, because it falls through to this handler with id === 'slots'",
+        "403 {\"error\":\"Not authorized\"} when the caller is not the owning physician, not the patient, and not active staff at appt.clinicId",
+        "500 {\"error\":\"Failed to delete appointment\"} on a thrown error — notably Prisma P2025 when a concurrent request already deleted the row between the findUnique and the delete (the client sees 500, not 404)",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter"
+      ],
+      "requestBody": [],
+      "requestQuery": [],
+      "dbWrites": [
+        "appointments — 1 hard DELETE (prisma.appointment.delete), NOT in a transaction and NOT atomic with the preceding findUnique"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "ClinicStaff (findFirst — only evaluated when the caller is neither the owning physician nor the patient)"
+      ],
+      "sideEffects": [
+        "NONE beyond the row removal: no notification, no email, no push, no audit row, no cache invalidation.",
+        "Orphans are left behind: payments.appointmentId, waiting_queues.appointmentId and video_sessions.appointmentId keep pointing at the vanished id"
+      ],
+      "externalDeps": [],
+      "quirks": [
+        "This is a HARD delete (prisma.appointment.delete), even though Appointment carries a `deletedAt DateTime?` soft-delete column documented as 'null means active'. Nothing in this router ever writes or filters deletedAt — a port must hard-delete, not soft-delete.",
+        "Route-order shadowing: router.delete('/slots/:id') is registered at L96, long before this handler at L928, so DELETE /api/appointments/slots/<uuid> deactivates a TimeSlot (isActive: false) and never reaches here. But DELETE /api/appointments/slots — one path segment, no id — DOES match this route with id === 'slots' and returns 404 {\"error\":\"Appointment not found\"}.",
+        "THE PATIENT IS ALLOWED TO DELETE. isPatient (appt.patientUserId === req.user.id) is in the allow-list, so a patient can permanently erase clinic records from the physician's calendar.",
+        "No status restriction at all: a COMPLETED, CANCELLED or NO_SHOW appointment is just as deletable as a PENDING one. Completed-visit history disappears with it.",
+        "Authorization short-circuits: the ClinicStaff query is skipped entirely when isPhysician or isPatient is true, so the staff branch is only reachable for third parties. A port that always runs the staff query would issue an extra read but must not change the outcome.",
+        "The physician check is identity-based (appt.physicianId === physician.id), so a DIFFERENT physician practising at the same clinic gets 403 unless they also hold an active ClinicStaff row there.",
+        "NO notification is sent to anyone. The patient is never told their appointment was erased, and the physician is never told a patient erased it — asymmetric with /confirm and /cancel, which both notify (and /cancel even emails).",
+        "Nothing cleans up dependents. payments.appointmentId, waiting_queues.appointmentId and video_sessions.appointmentId are plain `String?` columns with NO Prisma relation and NO database FK, so the delete always succeeds and leaves dangling references. A .NET/SQL Server port that introduces real foreign keys here will start failing this endpoint (or cascade-deleting payments) unless those columns stay unconstrained.",
+        "The findUnique-then-delete pair is not atomic. Two concurrent deletes: the first returns 200, the second throws P2025 inside the delete and surfaces as 500 'Failed to delete appointment' rather than the 404 the pre-check was meant to give.",
+        "No cache invalidation. GET / and GET /today are wrapped in cacheMiddleware(15) keyed `route:<userId>:<originalUrl>` in an in-process memory cache, so the deleted appointment can keep appearing in that same user's list for up to 15 seconds — and because the cache is per-process, under PM2 cluster mode the staleness is nondeterministic across workers.",
+        "Appointment.id is a plain text column (String @id @default(uuid()) with no @db.Uuid), so a malformed/non-UUID :id causes no cast error — it simply misses and returns 404.",
+        "The success body has no `deletedAt`, no `id`, and no status echo — a client cannot confirm WHICH row went away from the response alone."
+      ]
+    }
+  ]
+}

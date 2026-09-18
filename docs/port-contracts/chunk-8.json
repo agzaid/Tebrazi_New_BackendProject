@@ -1,0 +1,372 @@
+{
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/",
+      "nodeLines": "L182-L262",
+      "summary": "Physician creates a new visit (status IN_PROGRESS) for either an app-user patient (patientUserId) or a physician-owned local chart (clinicPatientId). Returns the created Visit row with three shallow relation objects. Sets visitDate to server now, bumps ClinicPatient.lastVisitDate when a clinicPatientId is given, and writes a fire-and-forget audit row.",
+      "auth": "router.use(authCheck) -> JWT Bearer, req.user = decoded token. Then auditLog('CREATE','visit') wraps res.json. NO userType check at all: any authenticated user reaches the handler; the gate is (a) a PhysicianProfile must exist for req.user.id -> otherwise 400 'Physician profile required' (NOT 403), and (b) prisma.clinic.findFirst({id: clinicId, physicianId: physician.id}) -> otherwise 403 'Not your clinic'. There is NO check that the physician is connected to the patient, and NO ownership check on clinicPatientId.",
+      "successStatus": 201,
+      "responseShape": "{\n  \"id\": \"<uuid>\",\n  \"organizationId\": \"<uuid, copied from clinic.organizationId>\",\n  \"clinicId\": \"<uuid>\",\n  \"physicianId\": \"<uuid, PhysicianProfile.id — NOT userId>\",\n  \"patientUserId\": \"<uuid|arbitrary string>\",\n  \"subprofileId\": \"<uuid>|null\",\n  \"clinicPatientId\": \"<uuid>|null\",\n  \"status\": \"IN_PROGRESS\",\n  \"audioUrl\": null,\n  \"rawTranscript\": null,\n  \"rawNotes\": \"<string>|null\",\n  \"subjective\": null,\n  \"objective\": null,\n  \"assessment\": null,\n  \"plan\": null,\n  \"chiefComplaint\": \"<string>|null\",\n  \"diagnosis\": [],\n  \"diagnosisCodes\": null,\n  \"followUpDate\": null,\n  \"followUpNotes\": null,\n  \"sharedSections\": null,\n  \"patientFeedback\": null,\n  \"patientFeedbackAt\": null,\n  \"patientDismissedAt\": null,\n  \"visitDate\": \"2026-09-03T10:11:12.345Z\",\n  \"specialtyData\": null,\n  \"completedAt\": null,\n  \"createdAt\": \"2026-09-03T10:11:12.345Z\",\n  \"updatedAt\": \"2026-09-03T10:11:12.345Z\",\n  \"deletedAt\": null,\n  \"clinic\": { \"name\": \"<string>\" },\n  \"subprofile\": null,\n  \"clinicPatient\": null\n}\n\n// When subprofileId resolves non-null:\n//   \"subprofile\": { \"name\": \"<string>\", \"relation\": \"SELF|SPOUSE|CHILD|PARENT|SIBLING|OTHER\" }\n// When clinicPatientId is non-null:\n//   \"clinicPatient\": { \"id\": \"<uuid>\", \"name\": \"<string>\", \"phone\": \"<string>|null\" }\n\n// Key order = Prisma model field order (as listed above), then relations in include order:\n// clinic, subprofile, clinicPatient.\n// clinic has ONLY { name } — no id, no specialty (differs from GET / and GET /:id which return clinic.id).\n// subprofile has ONLY { name, relation } — no id (differs from GET / and GET /:id which return subprofile.id).\n// All DateTime values are JSON.stringify(Date) => ISO-8601 UTC with exactly 3 fractional digits and a 'Z'.\n// `diagnosis` is String[] @default([]) => ALWAYS an array, never null; here always [].\n// There is NO `appointmentId` key in the response — the Visit model has no such column.",
+      "requestBody": [
+        "clinicId: string — REQUIRED (checked first)",
+        "patientUserId: string — required unless clinicPatientId is supplied",
+        "clinicPatientId: string — required unless patientUserId is supplied",
+        "subprofileId: string (optional)",
+        "chiefComplaint: string (optional)",
+        "rawNotes: string (optional)",
+        "appointmentId: string (optional) — READ but NEVER PERSISTED; used only to look up Appointment.subprofileId"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits — INSERT (prisma.visit.create). NOT in a transaction.",
+        "clinic_patients — UPDATE lastVisitDate = now(), only when body.clinicPatientId is truthy; awaited but wrapped in .catch(() => {}) so failures are silent and do not affect the 201.",
+        "activity_logs — INSERT via auditLog middleware (action 'CREATE', resource 'visit', resourceId = response body id, metadata {method:'POST', path:req.originalUrl}, ipAddress, userAgent sliced to 256). Fire-and-forget, .catch(() => {}). Only written when res.statusCode < 400 AND req.user?.id is set."
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId — userId is @unique)",
+        "Clinic (findFirst by { id: clinicId, physicianId })",
+        "ClinicPatient (findUnique by clinicPatientId — only when clinicPatientId given and patientUserId absent)"
+      ],
+      "externalDeps": [],
+      "sideEffects": [
+        "ClinicPatient.lastVisitDate touched",
+        "ActivityLog audit row",
+        "No notifications, no cache invalidation, no external calls"
+      ],
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header is missing or does not start with 'Bearer '",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws (bad signature/expired/malformed)",
+        "400 {\"error\":\"clinicId is required\"} when body.clinicId is falsy (checked BEFORE the patient check)",
+        "400 {\"error\":\"patientUserId or clinicPatientId is required\"} when BOTH body.patientUserId and body.clinicPatientId are falsy",
+        "400 {\"error\":\"Physician profile required\"} when no PhysicianProfile row exists for req.user.id — note 400, not 403",
+        "403 {\"error\":\"Not your clinic\"} when no Clinic matches { id: clinicId, physicianId: physician.id } (covers both 'clinic does not exist' and 'clinic belongs to someone else' — same body for both)",
+        "500 {\"error\":\"Failed to create visit\"} on any thrown error (FK violation on clinicId/organizationId/subprofileId/clinicPatientId, invalid enum, Prisma validation). No detail/details key is added on this route."
+      ],
+      "quirks": [
+        "GLOBAL BODY SANITIZER (server/src/index.js L55-L81) mutates req.body BEFORE this handler for every request. It recursively walks strings/arrays/objects and: strips <script>...</script> blocks; strips opening/closing tags for script|iframe|embed|object|applet|form|input|textarea|select|button|link|meta|base|style; REMOVES any /\\bon\\w+\\s*=\\s*(\"...\"|'...'|[^\\s>]*)/gi match — so clinical prose like 'onset = 3 days ago' becomes ' days ago'; removes /(?:javascript|data|vbscript)\\s*:/gi — so 'data: 2 units' becomes ' 2 units'; removes 'expression('; and REPLACES /url\\s*\\(/gi with the literal 'url\\\\(' (inserts a backslash). The .NET port must reproduce this exactly or chiefComplaint/rawNotes will differ byte-for-byte. Query params and route params are NOT sanitized.",
+        "`appointmentId` is accepted in the body but the Visit model has NO appointmentId column. It is used ONLY to fetch Appointment.subprofileId for auto-propagation, then discarded. The link between visit and appointment is never persisted anywhere.",
+        "Auto-propagation of subprofileId: only runs when body.subprofileId is falsy AND body.appointmentId is truthy. The appointment lookup is wrapped in a bare try/catch that swallows everything (`catch { }`), and there is no ownership check on the appointment — any appointmentId from any tenant can donate its subprofileId.",
+        "clinicPatientId fallback is a data-integrity landmine: when clinicPatientId is given without patientUserId, `resolvedPatientUserId = cp?.linkedUserId || userId`. If the ClinicPatient does not exist, or exists but has no linkedUserId, the visit's patientUserId is silently set to THE PHYSICIAN'S OWN userId. No 404, no error. Consequence: the physician then satisfies the `visit.patientUserId === userId` gate on PATCH /:id/patient-note, PUT /:id/patient-feedback and DELETE /:id/patient-dismiss for that visit, and VISIT_COMPLETED notifications for it are sent to the physician.",
+        "No ownership/tenancy check on clinicPatientId — a physician can attach another physician's ClinicPatient to their visit (and bump its lastVisitDate).",
+        "patientUserId has NO foreign key and NO relation in the Prisma schema (just `patientUserId String` + @@index). Any arbitrary string is accepted and stored; there is no validation that the user exists or is connected to the physician, despite the docstring claiming 'must be connected to the patient'.",
+        "Empty-string coalescing: chiefComplaint, rawNotes, subprofileId and clinicPatientId all go through `x || null`, so '' is stored as NULL, not ''. AppointmentsPage.jsx sends `chiefComplaint: appt.reason || ''`, which therefore lands as null.",
+        "visitDate is always `new Date()` on the server. A client-supplied visitDate is ignored (not even read).",
+        "organizationId is derived from the clinic row, never from the JWT.",
+        "status is not settable — always the schema default IN_PROGRESS.",
+        "The response's `clinic` object has only { name } and `subprofile` only { name, relation }. This is narrower than every other visit endpoint in the file. A .NET port that reuses one shared VisitDto here will emit extra keys (clinic.id, subprofile.id) and break byte-identity.",
+        "No transaction: visit INSERT and the clinic_patients UPDATE are two separate statements, and the second silently swallows failures.",
+        "auditLog's res.json override reads `req.params?.id || data?.id`; for POST there is no params.id so the audit resourceId is the newly created visit id.",
+        "auditLog also appends `reason` to metadata when req.body.reason exists — visits never send it, but a client that did would get it logged.",
+        "The response is the raw Prisma object serialized by Express's JSON.stringify: Prisma truncates Postgres timestamps to millisecond precision, so .NET must emit exactly 3 fractional digits + 'Z' (never 7 digits, never an offset like +00:00)."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id",
+      "nodeLines": "L391-L476",
+      "summary": "Owning physician updates visit documentation. Two distinct branches: (A) if visit.status === 'COMPLETED', ONLY followUpDate/followUpNotes may be edited (anything else -> 400), and a FOLLOW_UP_SET notification fires when the date actually changes; (B) otherwise a field-by-field patch of raw notes, SOAP, metadata, follow-up and specialtyData. Both branches respond with the full raw Visit row (no relations, no message key).",
+      "auth": "router.use(authCheck) -> JWT Bearer (401 on failure). No auditLog. In-handler: visit must exist (404 first), then a PhysicianProfile must exist for req.user.id AND visit.physicianId must equal physician.id, else 403 'Not your visit'. Patients can never reach a 2xx here. NOTE the check order is visit-then-physician, the OPPOSITE of DELETE /:id.",
+      "successStatus": 200,
+      "responseShape": "// Identical shape for BOTH branches: the raw Visit row, all scalars, NO relations, NO `message`.\n{\n  \"id\": \"<uuid>\",\n  \"organizationId\": \"<uuid>\",\n  \"clinicId\": \"<uuid>\",\n  \"physicianId\": \"<uuid>\",\n  \"patientUserId\": \"<string>\",\n  \"subprofileId\": \"<uuid>|null\",\n  \"clinicPatientId\": \"<uuid>|null\",\n  \"status\": \"IN_PROGRESS|COMPLETED|CANCELLED|ARCHIVED\",\n  \"audioUrl\": \"<string>|null\",\n  \"rawTranscript\": \"<string>|null\",\n  \"rawNotes\": \"<string>|null\",\n  \"subjective\": \"<string>|null\",\n  \"objective\": \"<string>|null\",\n  \"assessment\": \"<string>|null\",\n  \"plan\": \"<string>|null\",\n  \"chiefComplaint\": \"<string>|null\",\n  \"diagnosis\": [\"<string>\"],\n  \"diagnosisCodes\": null,\n  \"followUpDate\": \"2026-09-10T00:00:00.000Z\"|null,\n  \"followUpNotes\": \"<string>|null\",\n  \"sharedSections\": null,\n  \"patientFeedback\": \"<string>|null\",\n  \"patientFeedbackAt\": \"<iso>|null\",\n  \"patientDismissedAt\": \"<iso>|null\",\n  \"visitDate\": \"<iso>\",\n  \"specialtyData\": null,\n  \"completedAt\": \"<iso>|null\",\n  \"createdAt\": \"<iso>\",\n  \"updatedAt\": \"<iso>\",\n  \"deletedAt\": \"<iso>|null\"\n}\n\n// `diagnosis`: String[] @default([]) — ALWAYS an array, NEVER null; [] when empty.\n// `diagnosisCodes`: Json? — null when never set, or the client-supplied array verbatim,\n//    e.g. [{\"code\":\"E11.9\",\"description\":\"Type 2 diabetes mellitus without complications\"}].\n//    The client (VisitDetailPage autosave) sends [] routinely, so `[]` and `null` are BOTH real\n//    values and are NOT interchangeable.\n// `sharedSections`: Json? — null or e.g. [\"subjective\",\"assessment\",\"plan\"] (set only by /complete).\n// `specialtyData`: Json? — null or an arbitrary flat object of string values, plus a `__templateKey` key\n//    when it was populated by generate-soap, e.g. {\"iop_od\":\"14\",\"iop_os\":\"15\",\"__templateKey\":\"ophthalmology\"}.\n// followUpDate is a full ISO instant even though the client sends 'YYYY-MM-DD'.\n// No relation keys (clinic/physician/subprofile/clinicPatient) and no patientUser here.",
+      "requestBody": [
+        "rawNotes: string|null (optional)",
+        "rawTranscript: string|null (optional)",
+        "chiefComplaint: string|null (optional)",
+        "diagnosis: string[] (optional) — Postgres String[]; a non-array value causes a Prisma error -> 500",
+        "diagnosisCodes: Json (optional) — usually [{code, description}]; client sends [] when empty",
+        "specialtyData: Json (optional) — arbitrary object",
+        "subjective: string|null (optional)",
+        "objective: string|null (optional)",
+        "assessment: string|null (optional)",
+        "plan: string|null (optional)",
+        "followUpDate: string|null (optional) — client sends 'YYYY-MM-DD' or null",
+        "followUpNotes: string|null (optional)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits — UPDATE (single statement, NOT in a transaction). Branch A writes only followUpDate/followUpNotes; branch B writes only the keys present in the body.",
+        "notifications — INSERT (branch A only, when the follow-up date actually changed), via notificationService.createNotification; whole block wrapped in try/catch so failures never affect the 200."
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId, for the ownership gate)",
+        "PhysicianProfile again inside the branch-A notification block, this time with include:{user:{select:{displayName}}} — a shadowing re-fetch of the same row",
+        "User (inside createNotification, to resolve email/displayName when sendEmail)",
+        "DeviceToken (inside pushService.send — always attempted)"
+      ],
+      "externalDeps": [
+        "notificationService.createNotification (branch A only)",
+        "emailService.sendEmail (branch A only, sendEmail: true)",
+        "pushService.send (always attempted by createNotification, best-effort)"
+      ],
+      "sideEffects": [
+        "Branch A only: FOLLOW_UP_SET notification row + email to visit.patientUserId + push attempt. Title 'Follow-up Date Set'. Message: `Dr. ${physician?.user?.displayName || 'Your doctor'} has scheduled a follow-up for ${fDate}.` plus ` Note: ${followUpNotes}` appended when followUpNotes is truthy. data = { visitId, followUpDate } where followUpDate is the RAW CLIENT STRING, not the normalized Date.",
+        "Branch B: no notifications, no side effects at all.",
+        "No cache invalidation anywhere (GET /follow-ups-due is cached 30s and is NOT invalidated by this write)."
+      ],
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing / not Bearer",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws",
+        "404 {\"error\":\"Visit not found\"} when prisma.visit.findUnique({where:{id}}) returns null — note NO deletedAt filter, so soft-deleted (deletedAt set) and ARCHIVED visits ARE found and ARE editable",
+        "403 {\"error\":\"Not your visit\"} when the caller has no PhysicianProfile OR visit.physicianId !== physician.id (same body for both — a patient calling this always gets 403, never 200)",
+        "400 {\"error\":\"Cannot edit a completed visit\"} when visit.status === 'COMPLETED' and the body is not follow-up-only (see quirks for the exact predicate)",
+        "500 {\"error\":\"Failed to update visit\"} on any thrown error — including a bad `diagnosis` type, an unparseable followUpDate producing Invalid Date, or a Prisma validation error"
+      ],
+      "quirks": [
+        "GLOBAL BODY SANITIZER applies here too (see POST / quirk 1). It runs over rawNotes, rawTranscript, chiefComplaint, all four SOAP fields, followUpNotes, and every string inside diagnosis[] / diagnosisCodes / specialtyData. The 'on\\w+=' rule is the dangerous one for clinical text ('onset = ...' loses the value); the 'url(' -> 'url\\\\(' rule silently inserts a backslash.",
+        "`!== undefined` semantics: JSON has no undefined, so the effective rule is 'key PRESENT in the JSON body'. `null` counts as present. The port must distinguish absent-key from null-value per field, not use a nullable-DTO-with-defaults.",
+        "THE isFollowUpOnly PREDICATE OMITS specialtyData. It is: (followUpDate !== undefined || followUpNotes !== undefined) && rawNotes/rawTranscript/chiefComplaint/diagnosis/diagnosisCodes/subjective/objective/assessment/plan ALL === undefined. specialtyData is NOT in that exclusion list. So PUT on a COMPLETED visit with body {followUpNotes:'x', specialtyData:{...}} returns 200 and SILENTLY DROPS specialtyData (branch A builds followUpData from only the two follow-up fields). The same body without followUpDate/followUpNotes returns 400.",
+        "Branch A applies ONLY followUpDate/followUpNotes even though other recognized keys may have been present-but-ignored — no error, no warning.",
+        "The 'completed' guard checks ONLY status === 'COMPLETED'. ARCHIVED and CANCELLED visits fall through to branch B and are fully editable, including their SOAP notes.",
+        "followUpDate parsing: `new Date(followUpDate)`. The client sends a bare 'YYYY-MM-DD', which JS parses as UTC midnight -> stored 'YYYY-MM-DDT00:00:00.000Z'. .NET's DateTime.Parse on a date-only string yields LOCAL midnight — the port MUST force UTC or every follow-up date shifts by the server offset.",
+        "followUpDate falsy coalescing: `followUpDate ? new Date(followUpDate) : null` — so '' and null both clear the column. But `0` and `false` would also clear it.",
+        "Notification-change detection compares apples to oranges: oldDate = visit.followUpDate.toISOString().split('T')[0] (a 'YYYY-MM-DD' UTC date string) vs newDate = the raw client string. If a client ever sends a full ISO datetime, newDate !== oldDate is always true and the FOLLOW_UP_SET notification+email re-fires on every autosave. The client autosaves every 3 seconds while editing.",
+        "Clearing the follow-up date (followUpDate: null) sends NO notification, because the guard is `if (newDate && newDate !== oldDate)`.",
+        "The notification's human date uses `new Date(followUpDate).toLocaleDateString('en-US', {weekday:'long',month:'long',day:'numeric',year:'numeric'})` — evaluated in the SERVER's timezone, so a UTC-midnight date renders as the previous day on any negative-offset server. Format example: 'Thursday, September 10, 2026'.",
+        "Inside the branch-A notification block a new `const physician` SHADOWS the outer one and re-queries PhysicianProfile with the user include — an extra DB round trip on every follow-up-date change.",
+        "An empty JSON body ({}) on a non-completed visit yields updateData = {} and still issues prisma.visit.update, which bumps updatedAt (@updatedAt) and returns 200 with a new updatedAt.",
+        "`diagnosis` (String[]) and `diagnosisCodes` (Json?) are different types with confusingly similar names; the client only ever sends diagnosisCodes.",
+        "Passing diagnosisCodes: null hits Prisma's nullable-Json path (NullableJsonNullValueInput) — the port must write SQL NULL, and the response must serialize `diagnosisCodes: null` (not the JSON literal string \"null\").",
+        "Response leaks rawNotes/rawTranscript/audioUrl — acceptable only because the gate is physician-only; the port must not add its own patient-safe stripping here.",
+        "No transaction and no optimistic concurrency: the 3-second client autosave plus a manual save can interleave and last-write-wins per whole-row update."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/complete",
+      "nodeLines": "L488-L600",
+      "summary": "Owning physician marks the visit COMPLETED, stamps completedAt, and stores the M1.7 sharedSections whitelist controlling which SOAP sections the patient may see. Then fires a cascade of independently-try/caught side effects: patient VISIT_COMPLETED notification+email, per-staff VISIT_COMPLETED_STAFF notifications, waiting-room auto-completion, and two blocks that are DEAD CODE. Responds with the full Visit row plus a trailing `message` key.",
+      "auth": "router.use(authCheck) -> JWT Bearer (401). No auditLog. In-handler: visit must exist (404), then PhysicianProfile must exist for req.user.id AND visit.physicianId === physician.id, else 403 'Not your visit'. Visit-then-physician order.",
+      "successStatus": 200,
+      "responseShape": "// The full raw Visit row (post-update) spread, with `message` appended LAST.\n{\n  \"id\": \"<uuid>\",\n  \"organizationId\": \"<uuid>\",\n  \"clinicId\": \"<uuid>\",\n  \"physicianId\": \"<uuid>\",\n  \"patientUserId\": \"<string>\",\n  \"subprofileId\": \"<uuid>|null\",\n  \"clinicPatientId\": \"<uuid>|null\",\n  \"status\": \"COMPLETED\",\n  \"audioUrl\": \"<string>|null\",\n  \"rawTranscript\": \"<string>|null\",\n  \"rawNotes\": \"<string>|null\",\n  \"subjective\": \"<string>|null\",\n  \"objective\": \"<string>|null\",\n  \"assessment\": \"<string>|null\",\n  \"plan\": \"<string>|null\",\n  \"chiefComplaint\": \"<string>|null\",\n  \"diagnosis\": [\"<string>\"],\n  \"diagnosisCodes\": null,\n  \"followUpDate\": \"<iso>|null\",\n  \"followUpNotes\": \"<string>|null\",\n  \"sharedSections\": null,\n  \"patientFeedback\": \"<string>|null\",\n  \"patientFeedbackAt\": \"<iso>|null\",\n  \"patientDismissedAt\": \"<iso>|null\",\n  \"visitDate\": \"<iso>\",\n  \"specialtyData\": null,\n  \"completedAt\": \"2026-09-03T10:11:12.345Z\",\n  \"createdAt\": \"<iso>\",\n  \"updatedAt\": \"<iso>\",\n  \"deletedAt\": \"<iso>|null\",\n  \"message\": \"Visit completed and shared with patient\"\n}\n\n// `sharedSections` is EITHER null (share all sections) OR the filtered client array,\n//    e.g. [\"subjective\",\"assessment\",\"plan\"]. It is NEVER [] — an empty result is coerced to null.\n//    Order and duplicates from the client array are preserved verbatim after filtering.\n// `status` is always \"COMPLETED\" and `completedAt` always the server 'now' of this request.\n// `message` is the LAST key (object spread then literal), which matters for byte-identical output.\n// No relations are included.",
+      "requestBody": [
+        "sharedSections: string[]|null|absent (optional) — subset of ['subjective','objective','assessment','plan']; anything not an array is treated as 'share all'"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits — UPDATE { status:'COMPLETED', completedAt: now(), sharedSections: <array|null> }. NOT in a transaction.",
+        "appointments — UPDATE { status:'COMPLETED' } — DEAD CODE, never executes (see quirks).",
+        "notifications — INSERT one VISIT_COMPLETED for the patient (try/caught).",
+        "notifications — INSERT one VISIT_COMPLETED_STAFF per active ClinicStaff row, sequentially in a for-await loop (try/caught as a whole block).",
+        "waiting_queues — updateMany { status:'COMPLETED', completedAt: now() } for matching rows (try/caught).",
+        "payments — updateMany { visitId: id } — DEAD CODE, never executes (see quirks).",
+        "device_tokens — deleteMany possible inside pushService when a token is rejected."
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId, ownership gate)",
+        "ClinicStaff (findMany where { clinicId: visit.clinicId, isActive: true }, select userId)",
+        "User (findUnique by visit.patientUserId, select displayName — for the staff message; and again inside createNotification for email)",
+        "WaitingQueue (updateMany — read+write)",
+        "Payment (updateMany — dead code)",
+        "DeviceToken (inside pushService.send)"
+      ],
+      "externalDeps": [
+        "notificationService.createNotification (required twice: once for patient, once per staff member)",
+        "emailService.sendEmail (patient notification only, sendEmail: true)",
+        "pushService.send (always attempted per notification)"
+      ],
+      "sideEffects": [
+        "Patient notification: type 'VISIT_COMPLETED', title 'Visit Summary Available', message 'Your visit summary is now available. Check your health records for details.', data { visitId }, sendEmail true (subject = title, html '<h2>{title}</h2><p>{message}</p>').",
+        "Staff notifications: type 'VISIT_COMPLETED_STAFF', title 'Visit Completed', message `${patientUser?.displayName || 'Patient'}'s visit is done${followUpText}` where followUpText = ` — Follow-up: ${new Date(updated.followUpDate).toLocaleDateString()}` (EM DASH U+2014, server locale/TZ) when updated.followUpDate is truthy, else ''. data { visitId, patientUserId, followUpDate: updated.followUpDate (a Date, serialized into the notification JSON), clinicId }. sendEmail defaults false but push is still attempted.",
+        "Waiting-room auto-complete: waitingQueue rows for { clinicId: visit.clinicId, patientUserId: visit.patientUserId, queueDate between local-midnight and local-23:59:59.999, status in ['WAITING','BEING_SEEN'] } get status 'COMPLETED' and completedAt now().",
+        "Every side-effect block is individually try/caught and logged — NONE of them can turn the 200 into an error.",
+        "No cache invalidation (GET /follow-ups-due is cached 30s and is not busted)."
+      ],
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing / not Bearer",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws",
+        "404 {\"error\":\"Visit not found\"} when findUnique returns null — NO deletedAt filter, so soft-deleted and ARCHIVED visits are found and CAN be completed",
+        "403 {\"error\":\"Not your visit\"} when the caller has no PhysicianProfile OR visit.physicianId !== physician.id",
+        "500 {\"error\":\"Failed to complete visit\"} only if the main prisma.visit.update itself throws — every downstream side effect is swallowed"
+      ],
+      "quirks": [
+        "DEAD CODE #1: `if (visit.appointmentId)` — the Visit model has NO appointmentId column, so visit.appointmentId is ALWAYS undefined. The 'auto-complete the linked appointment' block NEVER runs. Appointments are never auto-completed by completing a visit, despite the comment.",
+        "DEAD CODE #2: the same undefined visit.appointmentId guards the 'Link existing payment to this visit' block, so payments are NEVER linked to a visit here. A faithful port must reproduce the no-op; 'fixing' it changes observable data.",
+        "EMPTY ARRAY MEANS SHARE EVERYTHING. `sectionsToStore = sharedSections.filter(valid); if (length === 0) sectionsToStore = null;` and null means 'all sections visible to the patient' in GET /:id. The React client builds the array from checkbox state (`Object.entries(shareSelections).filter(([,v]) => v).map(([k]) => k)`), so a physician who UNCHECKS EVERY SECTION shares ALL sections. This is a real privacy inversion the port must copy.",
+        "Any non-array sharedSections (missing key, null, a string, an object) leaves sectionsToStore = null -> share all. Only Array.isArray is checked.",
+        "Invalid entries are silently dropped; DUPLICATES AND CLIENT ORDER ARE PRESERVED — ['plan','plan','subjective'] is stored and echoed back verbatim as [\"plan\",\"plan\",\"subjective\"]. Do not dedupe or sort in the port.",
+        "The valid set is ['subjective','objective','assessment','plan'] — lowercase, exact match via Array.includes (case-sensitive). 'Subjective' is dropped.",
+        "Writing `sharedSections: null` targets a nullable Json column (Prisma NullableJsonNullValueInput). The port must persist SQL NULL (not the JSON literal null) and serialize it back as `\"sharedSections\": null`.",
+        "NO IDEMPOTENCY GUARD: there is no check on the current status. Re-completing an already COMPLETED (or ARCHIVED, or CANCELLED) visit succeeds, RESETS completedAt to now, OVERWRITES sharedSections, and RE-FIRES the patient email plus all staff notifications and the waiting-room update. The client calls handleSave() then /complete, so a double-click sends two rounds.",
+        "The waiting-room day window is built with `new Date(y, m, d)` and `new Date(y, m, d, 23,59,59,999)` — SERVER LOCAL midnight — but queueDate is stored as UTC. On a non-UTC server the window is offset and can miss or over-match rows. Reproduce with server-local boundaries, not UTC ones.",
+        "The staff notification message uses `.toLocaleDateString()` with NO locale and NO options — output depends entirely on the server's ICU locale/TZ (typically 'M/D/YYYY' on en-US). The separator before it is ' — ' with an EM DASH (U+2014), not a hyphen.",
+        "Staff notifications are created SEQUENTIALLY with await in a for-loop; a clinic with many staff members serializes that many notification inserts (plus a push attempt each) inside the request.",
+        "The patient notification goes to visit.patientUserId, which for an unlinked local ClinicPatient visit is THE PHYSICIAN'S OWN userId (see POST / quirk) — the physician emails themselves.",
+        "createNotification always attempts pushService.send even when sendEmail is false; failures are swallowed unless the message mentions 'findMany'.",
+        "The response spread puts `message` after `deletedAt`. Prisma key order for the visit scalars is the schema declaration order listed in responseShape.",
+        "GLOBAL BODY SANITIZER also walks the sharedSections array elements (sanitizeValue maps arrays) before this handler sees them — harmless for the four valid keywords, but the port should know the array is sanitized, not raw."
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/:id",
+      "nodeLines": "L1342-L1368",
+      "summary": "Physician 'deletes' a visit — but it is a status-only archive: sets status = 'ARCHIVED' and nothing else. deletedAt is NOT touched, no rows cascade, nothing is destroyed. Returns a plain message object.",
+      "auth": "router.use(authCheck) -> JWT Bearer (401). No auditLog on this route (despite being the destructive one). In-handler: PhysicianProfile is looked up FIRST — no profile => 403 'Physician access required'. Only THEN is the visit fetched (404), then ownership (403 'Not your visit'). This physician-then-visit order is the REVERSE of PUT /:id and PUT /:id/complete and is observable.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"message\": \"Visit archived successfully\"\n}\n\n// Exactly one key. NOT the visit, NOT { success: true }, NOT 204 No Content.\n// Note the sibling route DELETE /:id/investigations/:invId returns { \"success\": true } instead —\n// the two delete-ish routes in this file are deliberately inconsistent.",
+      "requestBody": [],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits — UPDATE { status: 'ARCHIVED' }. Single statement, NOT in a transaction. deletedAt is left untouched (stays null), and no child rows (prescriptions, investigations, payments, inventoryTransactions) are affected."
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)"
+      ],
+      "externalDeps": [],
+      "sideEffects": [
+        "None. No notification to the patient, no audit row, no cache invalidation."
+      ],
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing / not Bearer",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws",
+        "403 {\"error\":\"Physician access required\"} when no PhysicianProfile exists for req.user.id — RETURNED BEFORE the visit is even looked up, so a patient (or a bogus id) gets 403 here where every other route in the file would 404",
+        "404 {\"error\":\"Visit not found\"} when the visit does not exist (only reachable by an actual physician)",
+        "403 {\"error\":\"Not your visit\"} when visit.physicianId !== physician.id",
+        "500 {\"error\":\"Failed to archive visit\"} on any thrown error"
+      ],
+      "quirks": [
+        "The JSDoc above the handler is a LIE: it says 'permanently deletes a visit and all related records (prescriptions, investigations cascade-delete via Prisma schema)'. The body does a status update only. Port the code, not the comment.",
+        "deletedAt is NOT set. Because softDeleteFilter is { deletedAt: null }, an ARCHIVED visit still passes the soft-delete filter everywhere. It disappears from the physician list only because GET / applies status: { not: 'ARCHIVED' } when no explicit status filter is given — and it REAPPEARS if the client passes ?status=ARCHIVED.",
+        "The patient KEEPS SEEING the visit: GET / for non-physicians filters status: { in: ['COMPLETED','ARCHIVED'] }, so archiving does not hide it from the patient. Only DELETE /:id/patient-dismiss does that.",
+        "Re-archiving an already-ARCHIVED visit succeeds with the same 200 body (bumping updatedAt). No idempotency guard, no 409.",
+        "No status precondition: an IN_PROGRESS or COMPLETED visit can be archived directly, and PUT /:id will then still happily edit it (the edit guard only blocks status === 'COMPLETED').",
+        "Route order: this DELETE '/:id' is registered at L1342, before DELETE '/:id/patient-dismiss' at L1419, but Express matches on segment count so there is no shadowing between them.",
+        "No audit row is written even though POST / has auditLog — the destructive route is the unaudited one.",
+        "No body and no query params are read; a request body is ignored (but still sanitized by the global middleware)."
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/:id/patient-note",
+      "nodeLines": "L1379-L1409",
+      "summary": "Patient saves (or clears) their own free-text note on a visit. Reuses the SAME Visit.patientFeedback / patientFeedbackAt columns as PUT /:id/patient-feedback, but with different validation, different response shape, and NO physician notification. Returns a 3-key projection.",
+      "auth": "router.use(authCheck) -> JWT Bearer (401). No auditLog. In-handler: visit must exist (404), then visit.patientUserId must equal req.user.id, else 403 'Not your visit'. NO userType check — anyone whose id happens to be the visit's patientUserId passes, including a physician on an unlinked-ClinicPatient visit (see POST / quirk). NO status check: an IN_PROGRESS visit can be annotated.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"<uuid>\",\n  \"patientFeedback\": \"<string>|null\",\n  \"patientFeedbackAt\": \"2026-09-03T10:11:12.345Z\"|null\n}\n\n// Exactly THREE keys, in this order (Prisma `select` order == schema field order here).\n// The request field is named `note`; the response key is `patientFeedback` — the names differ.\n// patientFeedbackAt is an ISO-8601 UTC instant with 3 fractional digits + 'Z', or null.\n// Both keys are null together when the note is cleared.",
+      "requestBody": [
+        "note: string|null|absent — the note text. NOT trimmed. Falsy (absent, null, '') clears BOTH columns."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits — UPDATE { patientFeedback: note || null, patientFeedbackAt: note ? now() : null }. Single statement, no transaction."
+      ],
+      "crossModelReads": [],
+      "externalDeps": [],
+      "sideEffects": [
+        "NONE. Unlike PUT /:id/patient-feedback, which writes the same two columns, this route sends NO PATIENT_FEEDBACK notification to the physician. A note saved here is invisible in the physician's notification feed."
+      ],
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing / not Bearer",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws",
+        "404 {\"error\":\"Visit not found\"} when findUnique returns null — NO deletedAt filter and NO status filter",
+        "403 {\"error\":\"Not your visit\"} when visit.patientUserId !== req.user.id (the owning physician gets 403 here unless they are also the recorded patientUserId)",
+        "500 {\"error\":\"Failed to save note\"} on any thrown error — e.g. `note` sent as a number or object, which Prisma rejects for a String column"
+      ],
+      "quirks": [
+        "SILENT CLEAR ON EMPTY: `note || null` plus `note ? new Date() : null` means PATCH with { note: '' } (or {} or { note: null }) WIPES the patient's existing note and its timestamp, returning 200 with both keys null. There is no confirm, no distinct status.",
+        "NO TRIM: whitespace-only '   ' is truthy, so it is stored verbatim as '   ' and patientFeedbackAt is stamped. The sibling PUT /:id/patient-feedback rejects the same input with 400 — the two endpoints validate the same column differently.",
+        "COLUMN COLLISION: this route and PUT /:id/patient-feedback both own Visit.patientFeedback/patientFeedbackAt. Whichever fires last wins, and only the /patient-feedback path notifies the physician. Do not model these as two separate fields in the port.",
+        "NO STATUS GUARD: works on IN_PROGRESS, CANCELLED and ARCHIVED visits, while /patient-feedback requires status === 'COMPLETED'.",
+        "Response key name differs from the request key name: in `note`, out `patientFeedback`.",
+        "The response is a narrow `select` (id, patientFeedback, patientFeedbackAt) — NOT the full visit. Reusing a full VisitDto in the port breaks byte-identity here.",
+        "This is the only PATCH verb in the router; the client uses api.patch (VisitInboxPage.jsx L640). A .NET port must map the verb exactly — PUT will 404/405.",
+        "GLOBAL BODY SANITIZER runs on `note` before the handler: 'on\\w+=' sequences are stripped, 'javascript:/data:/vbscript:' prefixes removed, and 'url(' becomes 'url\\\\('. Patient-authored prose is therefore not stored verbatim.",
+        "No audit row, no notification, no cache invalidation.",
+        "The comment claims 'These notes persist even if the physician archives the visit' — true only because DELETE /:id merely sets status = 'ARCHIVED' and patients still see ARCHIVED visits."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/patient-feedback",
+      "nodeLines": "L611-L664",
+      "summary": "Patient attaches a post-visit note/question to a COMPLETED visit and the physician gets a PATIENT_FEEDBACK notification. Writes the same two columns as PATCH /:id/patient-note but trims, requires non-empty text and requires status COMPLETED. Returns a 2-key projection (no id).",
+      "auth": "router.use(authCheck) -> JWT Bearer (401). No auditLog. Validation order is unusual: the feedback-text check runs BEFORE the visit is fetched. Then visit must exist (404), then visit.patientUserId === req.user.id else 403 'Only the patient can leave feedback', then visit.status must be 'COMPLETED' else 400. No userType check.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"patientFeedback\": \"<trimmed string>\",\n  \"patientFeedbackAt\": \"2026-09-03T10:11:12.345Z\"\n}\n\n// Exactly TWO keys — NO `id`, unlike PATCH /:id/patient-note which returns three.\n// Neither value can be null on a 200 (the handler rejects empty text and always stamps the date).\n// The request field is `feedback`; the response key is `patientFeedback` — names differ.\n// patientFeedbackAt is an ISO-8601 UTC instant with exactly 3 fractional digits + 'Z'.\n// Hand-built object literal, so key order is exactly as written above.",
+      "requestBody": [
+        "feedback: string — REQUIRED, must be non-empty after .trim(); stored TRIMMED"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits — UPDATE { patientFeedback: feedback.trim(), patientFeedbackAt: now() }. Single statement, no transaction.",
+        "notifications — INSERT one PATIENT_FEEDBACK row for the physician's userId (whole block try/caught, cannot fail the 200).",
+        "device_tokens — possible deleteMany inside pushService on a rejected token."
+      ],
+      "crossModelReads": [
+        "User (findUnique by req.user.id, select displayName — for the notification message)",
+        "PhysicianProfile (findUnique by id: visit.physicianId, select userId — note: by PROFILE id, not userId)",
+        "DeviceToken (inside pushService.send)"
+      ],
+      "externalDeps": [
+        "notificationService.createNotification",
+        "pushService.send (always attempted by createNotification)"
+      ],
+      "sideEffects": [
+        "Physician notification: userId = physicianProfile.userId, type 'PATIENT_FEEDBACK', title 'Patient Left Visit Feedback', message `${patient?.displayName || 'A patient'} left a note on a completed visit.`, data { visitId }, sendEmail FALSE — so no email, but a push is still attempted.",
+        "Skipped entirely (no notification) if the PhysicianProfile row cannot be found.",
+        "No email, no audit row, no cache invalidation."
+      ],
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing / not Bearer",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws",
+        "400 {\"error\":\"Feedback text is required\"} when body.feedback is falsy OR trims to '' — CHECKED FIRST, before the visit lookup, so a nonexistent visit id with an empty body returns 400, not 404",
+        "404 {\"error\":\"Visit not found\"} when findUnique returns null — NO deletedAt filter",
+        "403 {\"error\":\"Only the patient can leave feedback\"} when visit.patientUserId !== req.user.id — note the wording differs from the 'Not your visit' used by every other route here",
+        "400 {\"error\":\"Can only add feedback to completed visits\"} when visit.status !== 'COMPLETED' (so ARCHIVED visits are rejected even though the patient can still see them in their inbox)",
+        "500 {\"error\":\"Failed to save feedback\"} on any thrown error — notably when `feedback` is a truthy non-string (e.g. a number), because `!feedback` is false and then `feedback.trim()` throws TypeError inside the try"
+      ],
+      "quirks": [
+        "VALIDATION ORDER IS OBSERVABLE: the 400 for empty feedback precedes the 404 for a missing visit and the 403 for wrong ownership. Empty text against someone else's visit returns 400, revealing nothing — but the port must not reorder these checks.",
+        "`feedback.trim()` is called twice conceptually — once for the guard, once for the stored value — so the STORED value is trimmed while PATCH /:id/patient-note stores untrimmed text into the SAME column.",
+        "TYPE HAZARD: a truthy non-string feedback (number 5, an object, an array) passes `!feedback` and then throws on .trim() -> 500 'Failed to save feedback'. Not a 400. The port must produce 500 for that input, not a model-binding 400.",
+        "COLUMN COLLISION with PATCH /:id/patient-note: both write Visit.patientFeedback and patientFeedbackAt. Only this route notifies the physician; the PATCH route can silently overwrite or clear what this one saved without any notification.",
+        "The response OMITS `id`, unlike the PATCH sibling. Two endpoints writing the same columns return two different shapes.",
+        "Response key differs from the request key: in `feedback`, out `patientFeedback`.",
+        "PhysicianProfile is looked up by `id: visit.physicianId` (the profile PK), not by userId — the port must not confuse the two id spaces.",
+        "The 'only the patient' gate is purely `visit.patientUserId === req.user.id`. For a visit created from an unlinked local ClinicPatient, POST / set patientUserId to the PHYSICIAN'S OWN userId, so the physician can leave 'patient feedback' on their own visit and then notify themselves.",
+        "Overwrites, not appends: each call replaces the whole note and re-stamps patientFeedbackAt, and re-fires the PATIENT_FEEDBACK notification. The client's Save Note button can be pressed repeatedly.",
+        "sendEmail is explicitly false here, but createNotification still always attempts pushService.send — so a push may go out with no email.",
+        "GLOBAL BODY SANITIZER mutates `feedback` before the handler: 'onset = ...' style text loses the value, 'javascript:/data:/vbscript:' are stripped, 'url(' becomes 'url\\\\(' — and this happens BEFORE the trim/empty check, so input consisting only of a stripped pattern (e.g. '<script>x</script>') can arrive as '' and yield 400 'Feedback text is required'.",
+        "Route registration: PUT '/:id' (L391) is registered before PUT '/:id/patient-feedback' (L611), but Express matches segment counts so there is no shadowing — '/:id' never captures 'x/patient-feedback'."
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/:id/patient-dismiss",
+      "nodeLines": "L1419-L1440",
+      "summary": "Patient hides a visit from their own inbox by stamping Visit.patientDismissedAt = now(). The row is untouched otherwise and stays fully visible to the physician. Returns a plain message object.",
+      "auth": "router.use(authCheck) -> JWT Bearer (401). No auditLog. In-handler: visit must exist (404), then visit.patientUserId must equal req.user.id, else 403 'Not your visit'. No userType check, no status check.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"message\": \"Visit removed from your inbox\"\n}\n\n// Exactly one key. Not 204, not { success: true }, and NOT the updated visit —\n// the handler awaits prisma.visit.update but DISCARDS its result.",
+      "requestBody": [],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits — UPDATE { patientDismissedAt: now() }. Single statement, no transaction. Result discarded."
+      ],
+      "crossModelReads": [],
+      "externalDeps": [],
+      "sideEffects": [
+        "None. No notification to the physician, no audit row, no cache invalidation."
+      ],
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing / not Bearer",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws",
+        "404 {\"error\":\"Visit not found\"} when findUnique returns null — NO deletedAt filter, NO status filter, and NO patientDismissedAt filter",
+        "403 {\"error\":\"Not your visit\"} when visit.patientUserId !== req.user.id",
+        "500 {\"error\":\"Failed to remove visit\"} on any thrown error"
+      ],
+      "quirks": [
+        "NOT IDEMPOTENT IN DATA: an already-dismissed visit can be dismissed again, and patientDismissedAt is OVERWRITTEN with the new now(). Same 200 body, different stored timestamp.",
+        "NO UNDISMISS ENDPOINT EXISTS anywhere in the router. Once stamped, the patient can never get the visit back into their inbox through the API (GET / hard-filters patientDismissedAt: null for non-physicians).",
+        "Asymmetric filtering: patientDismissedAt is applied ONLY in the non-physician branch of GET /. The physician list ignores it entirely, and GET /:id ignores it too — so a dismissed visit is still fetchable by direct id by the patient.",
+        "NO STATUS GUARD: a patient can dismiss an IN_PROGRESS visit they cannot even see in their list, pre-emptively hiding the summary before the physician completes it. Completing the visit later does NOT clear patientDismissedAt, so the VISIT_COMPLETED notification arrives for a visit that will never appear in the inbox.",
+        "The DELETE verb performs an UPDATE; nothing is deleted and deletedAt is not touched.",
+        "The update result is awaited and thrown away — the response never reflects the stored timestamp.",
+        "This route sits AFTER DELETE '/:id' (L1342) in registration order, but Express segment matching means '/:id' cannot shadow '/:id/patient-dismiss'. The path has exactly two segments after the mount point.",
+        "Mounted path seen by the client is DELETE /api/visits/:id/patient-dismiss (client/src/pages/VisitInboxPage.jsx L546); the client ignores the response body and only branches on success/failure.",
+        "No request body is read; any body sent is ignored (though still run through the global sanitizer)."
+      ]
+    }
+  ]
+}

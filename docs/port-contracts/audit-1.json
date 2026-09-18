@@ -1,0 +1,120 @@
+{
+  "missedRoutes": [
+    {
+      "method": "GET",
+      "path": "/interaction-history",
+      "nodeLines": "L165-L184",
+      "calledByClient": false,
+      "note": "M3.3 alert history. NOT in server-dotnet/docs/client-endpoints.txt and no client reference (grep for 'interaction-history' across client/src returns nothing). Shape: raw prisma.interactionAlert.findMany() rows echoed with no reshaping -> JSON ARRAY (never null; [] when empty, and [] with 200 at L171 for ANY caller lacking a PhysicianProfile, i.e. every PATIENT). Element keys (schema.prisma L709-722, in model order): id (uuid), physicianId (uuid|null), patientUserId (uuid|null), visitId (uuid|null - the column exists but check-interactions NEVER writes it at L849-856, so it is ALWAYS null in practice), drugs (raw Json = the allDrugs array, so it can contain non-string objects, see contractErrors), interactions (raw Json, @default(\"[]\")), alertCount (int), checkedAt (ISO-8601 string). Ordered checkedAt desc. QUIRK: `take` comes from `parseInt(req.query.limit) || 20` (L168) - ?limit=0 and ?limit=abc both fall through to 20; ?limit=1e6 yields 1 because parseInt stops at 'e'; ?limit=-5 passes take:-5, which Prisma interprets as reverse-take (the LAST 5 of the desc ordering = the 5 OLDEST alerts), not an error. A .NET port with an int binder + a clamp would diverge on all four."
+    },
+    {
+      "method": "GET",
+      "path": "/:id",
+      "nodeLines": "L190-L233",
+      "calledByClient": false,
+      "note": "Not in client-endpoints.txt; the client never fetches a single prescription (all client calls are /:id/pdf, /:id/sign, /:id/send, /:id/dispense, /:id/refill-request, /:id/refill-respond, /:id/stop-medication, /:id/resume-medication). Shape at L231 is `{...prescription, patientUser, isPhysician}` - the FULL 16 scalars plus: visit:{id, chiefComplaint(string|null), visitDate(ISO), patientUserId(uuid, never null per schema L622), clinic:{name, phone(string|null), address(string|null)}}, physician:{specialty(string|null), licenseNumber(string|null), user:{displayName, email}}, subprofile:{name, relation, dateOfBirth(ISO|null)}|null, patientUser:{displayName, email, phone(string|null)}|null, isPhysician(bool). NOTE this is a THIRD distinct visit/physician/subprofile projection - richer than GET / (which has no phone/address/licenseNumber/email/dateOfBirth) and different again from /:id/pdf. `isPhysician` is a computed non-model key: `physician && prescription.physicianId === physician.id` (L215) - it is the truthy AND result, so when the caller has no PhysicianProfile it serializes as `null`, NOT `false` (physician is null -> `null && ...` -> null). A .NET port emitting `false` would diverge. No deletedAt filter."
+    },
+    {
+      "method": "PUT",
+      "path": "/:id",
+      "nodeLines": "L242-L275",
+      "calledByClient": false,
+      "note": "Not in client-endpoints.txt; no client call site (PrescriptionPanel/PrescriptionsPage only PUT the /:id/<action> sub-routes). Shape at L269 is the bare `updated` row: exactly the 16 Prescription scalars, NO includes, NO message key - so it does not match POST / (which nests visit) nor /sign|/send|/dispense (which append a message). QUIRKS: (a) the only status precondition in the whole file - `if (prescription.status === 'SENT') return 400 {\"error\":\"Cannot edit a prescription that has already been sent\"}` (L259-261) - DISPENSED and CONFIRMED are still editable, only SENT is blocked; (b) `updateData` is built with `!== undefined` guards (L264-265), so an EMPTY body {} issues a prisma.update with `data: {}`, which still succeeds and still bumps updatedAt via @updatedAt - a port that short-circuits on an empty patch would leave updatedAt unchanged; (c) `notes: null` is accepted and clears the field, but `notes: undefined`/absent preserves it; (d) medications is written verbatim with no array validation - `{\"medications\": 5}` is persisted into the Json column and will later crash stop/resume; (e) 404 precedes 403."
+    }
+  ],
+  "contractErrors": [
+    {
+      "endpoint": "GET / and GET /summary",
+      "claim": "Neither entry mentions response caching; both are documented as computing their body per request.",
+      "truth": "L31 registers `cacheMiddleware(15)` and L144 registers `cacheMiddleware(30)`. server/src/lib/cacheMiddleware.js monkey-patches res.json and stores the response object in a plain in-process Map (server/src/lib/cache.js) under `route:${userId}:${req.originalUrl}`, then serves it verbatim for the TTL. There is ZERO invalidation anywhere in prescriptions.js (grep for 'cache.' in the file returns nothing), so after POST / or PUT /:id/send|sign|dispense the client's onRefresh() GET / can legitimately return the PRE-mutation array for up to 15s and /summary the pre-mutation counts for up to 30s. Because the key is req.originalUrl, `?visitId=x` is a separate cache entry, and `GET /` vs `GET /?` are separate entries.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "POST /check-interactions",
+      "claim": "Quirk documents only the literal `\"${n} interaction(s) found\"` for the normal AI path (B).",
+      "truth": "L854-858 returns `message: result.message` straight from aiGateway.checkDrugs. server/src/services/aiGateway.js L732-736: `message: allInteractions.length > 0 ? `${allInteractions.length} interaction(s) found` : 'No known interactions detected'`. So path B has TWO literals, and 'No known interactions detected' is the COMMON case (most checks find nothing). That is a fourth distinct message string on this endpoint that the extraction has no slot for. (A dead fifth exists at aiGateway L594 - 'Need at least 2 drugs to check' - unreachable because L804 short-circuits first.)",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /check-interactions",
+      "claim": "interactions elements are described as a fixed object shape (drug1/drug2/severity/description/recommendation/alternatives).",
+      "truth": "That shape is guaranteed ONLY on the two fallback branches (aiGateway.js L689-697 on JSON.parse failure, L701-708 on LLM throw). On the happy path L685-687 does `enrichedInteractions = JSON.parse(cleaned)` and echoes the RAW LLM array with no per-element normalization - elements may omit keys, carry extra keys, or hold non-string values. Additionally L734 is `[...allergyWarnings, ...enrichedInteractions]`: the deterministic string-match allergy warnings (L722-729, drug2 = `ALLERGY: ${allergen}`, severity always 'HIGH', recommendation always 'DO NOT prescribe. Consider alternatives.') are PREPENDED, so element order is allergy-warnings-first, then LLM output. The client depends on int.drug1/drug2/severity (client/src/pages/DrugScreeningsPage.jsx L92-116), so a .NET port must deserialize interactions as loose JSON, not a typed record.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "POST /check-interactions",
+      "claim": "drugsChecked is described as a deduped array of drug-name strings.",
+      "truth": "L780 is `.map(m => m.drugName || m)`. A stored medication element that is an object WITHOUT drugName maps to the whole OBJECT, which flows into allDrugs (L802) and is echoed verbatim in `drugsChecked`; a medication element that is already a plain string maps to itself. `new Set` never collapses distinct objects, so the <2 short-circuit at L804 can also be defeated by junk. Two consequences: (1) drugsChecked is `(string|object)[]`, not string[] - a .NET `List<string>` port throws or coerces; (2) when patientAllergies is non-empty, aiGateway.js L716 calls `drug.toLowerCase()` on that object -> TypeError -> the route's outer catch -> 500 {\"error\":\"Failed to check interactions\"}. Also note the dedup at L802 is exact-string and case-SENSITIVE ('Aspirin' and 'aspirin' both survive), and the order is inputMeds (request order) then subprofile currentMedication, then cross-prescription meds, then all-subprofile meds.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /extract-from-plan",
+      "claim": "\"Only null/undefined/''/0/false take the 400 path.\"",
+      "truth": "L1081 is `if (!planText || planText.trim().length < 5)`. Any string whose TRIMMED length is under 5 also 400s: \"abc\", \"ok\", \"    \", \"1234\" all return 400 {\"error\":\"Plan text is required\"}. A port that only checks emptiness returns 200 {\"medications\":[]} for those inputs, and the client (PrescriptionPanel L277) then renders 'No medications found in the Plan text' instead of surfacing the error.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "PUT /:id/resume-medication",
+      "claim": "\"medications is [] (empty array, never null) when the stored value was not an array.\"",
+      "truth": "Unreachable. When medications is not an array, meds = [] (L709) and length is 0, so at L710 every numeric index fails (`n >= 0` for n>=0, `n < 0` for negatives) -> 400; `null >= 0` is true -> 400. Only `undefined` and non-numeric strings slip past both NaN comparisons, and both then hit `const { stoppedAt, stoppedByPatient, ...cleanMed } = meds[idx]` at L715 destructuring `undefined` -> TypeError -> 500 {\"error\":\"Failed to resume medication\"}. No 200 response on this endpoint can ever carry medications: []. The extraction's stop-medication entry correctly makes no such claim.",
+      "severity": "cosmetic"
+    },
+    {
+      "endpoint": "PUT /:id/stop-medication",
+      "claim": "Quirks cover missing/null medicationIndex (400) but not non-integer index values.",
+      "truth": "L666 `medicationIndex < 0 || medicationIndex >= meds.length` compares with NaN for non-numeric strings, so \"abc\" passes the guard. Then L671-675 `{...meds[\"abc\"], stoppedAt, stoppedByPatient}` spreads `undefined` (legal, yields {}) and assigns a NAMED property onto the array. JSON.stringify ignores non-index array properties, so the 200 body is `{\"message\":\"Stopped undefined\",\"medications\":<array UNCHANGED>}` - the client shows a success toast for a no-op, and the write at L677-680 persists. Same for fractional indices (1.5 on a length-2 array). Resume-medication given the identical input instead 500s (L715), so the two endpoints diverge on the same payload. Also: a valid index whose element has no drugName yields `\"Stopped undefined\"` / `\"Resumed undefined\"` literally (L682, L723). A .NET `int medicationIndex` model binder returns 400 for all of these.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "PUT /:id/dispense",
+      "claim": "Rollback-leak and no-tenant-scoping quirks are noted, but the ordering of the status write vs. the inventory loop is not.",
+      "truth": "L458-461 flips status to DISPENSED BEFORE the loop, and there is no wrapping transaction. So a truthy-but-unparseable quantity (e.g. \"abc\") passes `!quantity` (L467), becomes NaN at L471, is sent as `decrement: NaN` (L475), Prisma throws, and the OUTER catch returns 500 {\"error\":\"Failed to dispense prescription\"} - with the prescription already DISPENSED and every earlier item in the loop already decremented and already carrying an inventoryTransaction row. Also silent-skip paths that a port must reproduce: quantity 0/''/null skipped (L467), item missing OR `!item.isActive` skipped (L470) - all absent from inventoryDeducted with no error. parseInt coercions are lossy: \"5 boxes\"->5, 1.9->1.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "PUT /:id/dispense",
+      "claim": "The inventoryDeducted element shape is truncated after the key name.",
+      "truth": "L505: `{ itemId, name: item.name, quantity: qty, newStock: updatedItem.currentStock }` - exactly 4 keys. `name` is a RENAME of InventoryItem.name (schema L731). `quantity` is the POSITIVE parseInt'd int, whereas the inventoryTransaction row stores `-qty` (L481) - opposite signs for the same number. `newStock` is read back from the post-decrement row, which under concurrency differs from the `Math.max(0, item.currentStock - qty)` written into the transaction row at L484. The array is [] (never null) when inventoryItems is absent, not an array, or empty.",
+      "severity": "cosmetic"
+    },
+    {
+      "endpoint": "POST /transcribe-rx",
+      "claim": "Error handling is described as JSON with fixed literals; multer failure modes are described only as a 25MB buffering cost.",
+      "truth": "L1067 is `res.status(500).json({ error: error.message || 'Failed to transcribe prescription' })` - the ONLY dynamic 500 message in the file; every transient aiGateway/OpenAI failure leaks its raw exception text into the `error` field. Separately, multer failures never reach this catch at all: fileFilter's `new Error('Only audio files are allowed')` (L966) and the 25MB LIMIT_FILE_SIZE MulterError are passed to next(err) and land in the global handler at server/src/index.js L311-317, which does `res.status(err.status || 500)` - MulterError has no .status, so a non-audio upload is 500 {\"error\":\"Only audio files are allowed\"} and an oversize upload is 500 {\"error\":\"File too large\"}, NOT 400/413, plus an extra `stack` key when NODE_ENV=development.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /summary",
+      "claim": "\"Exactly three keys, in that order. Always integers, never null.\"",
+      "truth": "True for the counted path, but the extraction omits the early return at L148: any caller without a PhysicianProfile - which is EVERY patient - gets 200 {\"signed\":0,\"sent\":0,\"total\":0\"} rather than 403/404, and the three DB counts are never issued. Same pattern at L41 for GET / and L171 for GET /interaction-history (200 []). A port that gates these on a physician role would return 403 and break patient pages.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /",
+      "claim": "Element field nullability is documented from the Prisma types.",
+      "truth": "Two fields are less nullable than a schema-driven port would assume, and one is dead code. Visit.clinicId is a REQUIRED scalar (schema.prisma L620), so the included `clinic: { name }` (L58) is ALWAYS a non-null object - never `\"clinic\": null`. Visit.patientUserId is likewise required (schema L622), which makes the `.filter(Boolean)` at L71 dead code and means `patientName` is absent only when the User row itself was hard-deleted. Conversely `subprofile` IS nullable (subprofileId String?) and serializes as `\"subprofile\": null`, and inside physician, `specialty` is nullable. The physician-branch include is also narrower than GET /:id and /:id/pdf: visit has NO phone/address, physician has NO licenseNumber/email, subprofile has NO dateOfBirth - three different projections of the same relations across the three GET endpoints.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /:id/pdf",
+      "claim": "The HTML body is described structurally but the date rendering is not pinned.",
+      "truth": "server/src/services/pdfService.js L23-24: `new Date(prescription.signedAt || prescription.createdAt).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })` -> e.g. `03 Sep 2026`, computed in the SERVER's local timezone (not UTC), and interpolated in BOTH the patient bar (L169) and the signature line (L197). A .NET port must format 'dd MMM yyyy' under en-GB against server-local time or the printed date shifts by a day near midnight. Also unpinned: `escapeHtml` (L8-16) returns '' for ANY falsy input (so numeric 0 renders empty) and escapes exactly & < > \" ' to &amp; &lt; &gt; &quot; &#39; - it does NOT escape backticks or slashes. And the patient-name precedence at L925-936 is subprofile FIRST as `${name} (${relation})`, THEN visit.clinicPatient?.name, THEN the platform user's displayName, else the literal 'Patient' - the subprofile branch wins even when a clinicPatient row exists.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /check-interactions, POST /extract-from-plan, GET /:id/pdf",
+      "claim": "Cited line anchors: early return L806, AI path L863, pdf L874-L945.",
+      "truth": "Anchor drift. The <2 early return is L804-806 with the res.json on L805; the normal AI-path res.json is L854-858, not L863; the /pdf handler spans L874-L946 (setHeader L939, send L940); extract-from-plan's res.json is L1138 and its 400 gate L1081. Minor, but the reviewer working from these ranges will miss the aiGateway indirection that produces `message` and `interactions`.",
+      "severity": "cosmetic"
+    }
+  ],
+  "routeOrderHazards": [
+    "GET summary - literal, registered L144, MUST precede GET /{id} (L190) or it binds as id=\"summary\" and returns 404 {\"error\":\"Prescription not found\"}. This is a real Express-order dependency in the source, not a theoretical one.",
+    "GET interaction-history - literal, registered L165, MUST precede GET /{id} (L190); the source even carries the comment \"(must be before /:id)\" at L162. Omitted entirely from the extraction, so a port that never registers it has no hazard - but a port that adds it after {id} silently 404s.",
+    "POST check-interactions - single-segment literal POST (L735). There is no POST /{id} in this file today, so Express has no conflict, but a .NET port that adds a POST /{id} (or an [HttpPost(\"{id}\")] catch-all) will swallow it. Register it before any parameterised POST sibling.",
+    "POST transcribe-rx - single-segment literal POST (L972); same hazard as check-interactions.",
+    "POST extract-from-plan - single-segment literal POST (L1078); same hazard as check-interactions.",
+    "Second-segment literals under /{id}/: pdf (GET, L874), sign, send, dispense, stop-medication, resume-medication, refill-respond (PUT), refill-request (POST). No parameterised /{id}/{x} sibling exists in this file, so there is no ordering conflict today - but do NOT introduce a /{id}/{action} catch-all in the port, and note that /{id}/pdf is registered at L874, i.e. AFTER POST /check-interactions, which is only harmless because segment counts and verbs differ."
+  ],
+  "verdict": "The extraction is solid on the headline behavioural quirks (auto-sign on POST /, /sign writing CONFIRMED, the two-status `signed` bucket, missing deletedAt filters, the /pdf-returns-HTML inversion, the refillNotes null-vs-preserve asymmetry, the stop-vs-resume 400/500 asymmetry, the em dash in the 1-drug message) - I re-derived each of those from the source and they hold. But it is incomplete and wrong in ways that will produce client bugs. Three of the file's 17 route registrations are missing entirely: GET /interaction-history (L165), GET /:id (L190), PUT /:id (L242). None of the three is in server-dotnet/docs/client-endpoints.txt and none has a client call site, which is why the count came out at 14 - but GET /:id carries a computed `isPhysician` key that serializes as `null` (not `false`) for non-physicians, and PUT /:id holds the file's only status precondition, so they are worth porting deliberately rather than by omission. The most consequential accuracy gaps: (1) GET / and GET /summary are wrapped in cacheMiddleware(15)/(30) with NO invalidation anywhere in the file - the extraction treats both as freshly computed, and a port without that stale window changes observable client behaviour after every mutation; (2) POST /check-interactions delegates `message` and `interactions` to aiGateway.checkDrugs, so path B has a second, more common message literal ('No known interactions detected') the extraction never mentions, and `interactions` is the RAW LLM JSON array on the happy path - not the fixed six-key record - with deterministic allergy warnings prepended, which the client indexes by drug1/drug2/severity; (3) drugsChecked can contain non-string objects via `m.drugName || m` at L780, which a typed .NET port cannot represent; (4) the extract-from-plan 400 gate is a trimmed-length-under-5 test, not an emptiness test. Two claims are outright unreachable or misstated: resume-medication can never return medications: [] on a 200, and stop-medication accepts non-numeric/fractional indices as a silent 200 no-op ('Stopped undefined') where resume 500s. Net: treat the 14 shapes as a good first pass, but re-derive check-interactions from aiGateway.js, add the caching layer, add the three missing routes, and re-test the stop/resume index-coercion matrix before calling the contract fixed."
+}

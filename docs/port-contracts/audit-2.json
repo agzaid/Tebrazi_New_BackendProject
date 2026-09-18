@@ -1,0 +1,190 @@
+{
+  "missedRoutes": [
+    {
+      "method": "POST",
+      "path": "/api/appointments/slots",
+      "nodeLines": "L57-L88",
+      "calledByClient": false,
+      "note": "The 20th router registration in the file and the ONLY one the extraction omitted. Body { clinicId, slots: [{dayOfWeek,startTime,endTime,slotDuration?}] }. Guards: 400 'clinicId and slots array required' when !clinicId || !slots || !Array.isArray(slots) || slots.length===0 (L61-63); 400 'Physician profile required' when no PhysicianProfile (L66); 403 'Not your clinic' when the clinic is not owned by that physician (L69-72). Success is 201 {\"count\": <int>, \"message\": \"<count> slots created\"} — byte-identical envelope to POST /slots/bulk, always plural. Per-slot slotDuration defaults to 30 (`s.slotDuration || 30`, L80), so a sent 0 becomes 30. Unlike /slots/bulk and /slots/sync-from-hours it does NOT deleteMany first, so it appends and can create exact duplicates. A missing/undefined dayOfWeek is NOT validated and reaches Prisma → 500 'Failed to create slots'. NOT present in server-dotnet/docs/client-endpoints.txt (the only POST /appointments/slots* entries there are /slots/bulk and /slots/sync-from-hours) and grep of client/src finds no caller — it is live-but-unused. Port it for parity, but it is not on the client's critical path."
+    }
+  ],
+  "contractErrors": [
+    {
+      "endpoint": "PUT /:id/check-in",
+      "claim": "Shape is the 22 Appointment scalars (+ message, per the pattern of confirm/cancel/complete). Quirk list covers only the notes/CHECKIN smuggling and repeat check-ins.",
+      "truth": "The response is `{ ...updated, message: 'Patient checked in', checkedInBy: userId, payment: <obj|null> }` (L1109-L1113). THREE keys follow the scalars, in that exact order: `message`, `checkedInBy` (a bare user-id string, duplicating what is buried inside the notes JSON), and `payment`, which is `{ id, amount, description }` (exactly 3 keys, L1112) or `null`. `amount` is Prisma Float → a plain JSON number (Clinic.consultationFee/followUpFee are Float? @default(300)/(200)).",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "PUT /:id/check-in",
+      "claim": "`payment` behaviour is not described; the shape example shows notes as a bare \"CHECKIN:{...}\".",
+      "truth": "(a) On a SECOND check-in of the same appointment, `existingPayment` is found (L1088-1090) so `autoPayment` stays null and the response is `payment: null` even though a PENDING payment exists — the client cannot infer 'no payment' from that key. (b) `payment` is also null when the Clinic row is missing (L1078 `if (clinic)`) or when the outer try throws (L1094). (c) `notes` APPENDS: `appt.notes ? `${appt.notes}\\nCHECKIN:${checkinNote}` : `CHECKIN:${checkinNote}`` (L1010). For a walk-in (notes already 'WALK_IN') the value is \"WALK_IN\\nCHECKIN:{...}\", and a third check-in yields \"...\\nCHECKIN:{...}\\nCHECKIN:{...}\". The bare-\"CHECKIN:{...}\" example is only the empty-notes case. (d) `confirmedAt: appt.confirmedAt || new Date()` (L1009) PRESERVES an existing timestamp — the opposite of PUT /:id/confirm, which overwrites unconditionally. (e) Fee selection `isFollowUp ? (clinic.followUpFee || 200) : (clinic.consultationFee || 300)` (L1083-1084): an explicitly-configured fee of 0 is falsy and silently becomes 300/200, so `fee > 0` (L1090) is effectively always true.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "POST /:id/intake-note",
+      "claim": "The dedupe lookup is broken and the update branch is dead code (correct), therefore the create branch always runs.",
+      "truth": "The extraction stops one step short of the consequence, and that step is the single biggest .NET porting trap in the file. PatientNote carries `@@unique([physicianUserId, patientUserId, subprofileId])` (server/prisma/schema.prisma, PatientNote model) and this handler ALWAYS writes subprofileId = NULL (L1168-1172 omits it). The datasource is `provider = \"postgresql\"` (schema L10), where NULLs are DISTINCT in a unique index — so the second intake note for the same physician+patient succeeds and silently creates a duplicate row, and GET-side note readers see two. On SQL Server a UNIQUE constraint treats NULLs as EQUAL, so the .NET port will raise a duplicate-key error on the second call and return 500 'Failed to save intake note' where Node returns 200. The port MUST use a filtered/NULL-tolerant unique index (or drop the constraint) or this endpoint becomes single-use per physician-patient pair. The same collision also hits any PatientNote written by routes/notes.js for that pair.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /queue",
+      "claim": "`visitStatus` is 'IN_PROGRESS' | 'COMPLETED' | null.",
+      "truth": "That is the code's own inline comment at L1294 and it is wrong. The Visit query at L1273-L1282 applies NO status filter — only clinicId + visitDate window — and `enum VisitStatus { IN_PROGRESS COMPLETED CANCELLED ARCHIVED }`. So `visitStatus` can also be 'CANCELLED' or 'ARCHIVED'. A .NET enum or client switch built on the two-value domain will fall through on real rows.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /queue",
+      "claim": "Row shape = appointment scalars + physician (full) + subprofile + patientUser + check-in fields.",
+      "truth": "There are FOUR more top-level row keys, appended by a second spread at L1291-L1298, and their names differ from the model fields: `visitStatus`, `visitFollowUp` (model field is Visit.followUpDate), `visitFollowUpNotes` (Visit.followUpNotes), `visitCompletedAt` (Visit.completedAt). visitFollowUp / visitCompletedAt are DateTime? → ISO-8601 UTC strings with ms, or null. Full row key order: 22 Appointment scalars, `subprofile`, `physician`, then `patientUser`, `checkedIn`, `checkedInAt`, `room`, then those four. Also: the overlay map `visitByPatient` is keyed by patientUserId ONLY with no orderBy on the findMany (L1284-L1287), so when a patient has several visits today the LAST row returned wins non-deterministically.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /queue",
+      "claim": "`physician` is a full Prisma include (correct: all 12 PhysicianProfile scalars incl. bio, scratchpadNotes, licenseNumber).",
+      "truth": "Incomplete — the include is `physician: { include: { user: { select: { displayName: true } } } }` (L1243-L1245), so `physician` also carries a NESTED `user: { displayName }` object (one key only, no id, no email). Confirmed PhysicianProfile scalars to emit: id, userId, licenseNumber, specialty, qualifications, bio, scratchpadNotes, yearsOfExperience, verified, verifiedAt, createdAt, updatedAt — then `user`.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /queue",
+      "claim": "`patientUser` includes phone but not id (correct).",
+      "truth": "Two additions the extraction's quirks omit: (a) it is exactly `{ displayName, phone }` and it is `null` (not `{}`) when the User row is missing, because it comes from a raw `findUnique` with no `|| null` fallback (L1250-L1253) — unlike GET / and GET /today, where the `|| null` is explicit; (b) it is an N+1: one findUnique per appointment inside `Promise.all` (L1249). A .NET port using a single batched join must still produce null (not an empty object) for a dangling patientUserId — and note Appointment has NO FK on patientUserId at all (the model's only relations are clinic, physician, subprofile, clinicPatient), so dangling ids are reachable in practice.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /queue",
+      "claim": "summary = { total, arrived, pending, completed, noShow } (envelope correctly identified).",
+      "truth": "The buckets are not disjoint and the totals will not reconcile: `pending: withVisitStatus.filter(a => !a.checkedIn && a.status !== 'COMPLETED').length` (L1305) counts NO_SHOW rows as pending, so every un-checked-in NO_SHOW is counted in BOTH `pending` and `noShow`, and total !== arrived + pending + completed. A port that 'fixes' the arithmetic changes numbers the client renders.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /queue",
+      "claim": "403 gate is 'physician OR staff'.",
+      "truth": "The physician branch requires clinic OWNERSHIP, not membership: `findUnique({ where:{userId}, include:{ clinics: { where:{id:clinicId}, take:1 } } })` then `isPhysician = physician && physician.clinics.length > 0` (L1218-L1222). A physician who works at the clinic but does not own it gets 403 'Not staff at this clinic' unless they also hold an active ClinicStaff row. Also note the appointment query itself (L1236-L1246) has NO physicianId filter — every physician's appointments at that clinic are returned to any staff member.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /",
+      "claim": "Response-shape fork on patientUser is fully characterised by the `userType==='PHYSICIAN' || where.clinicId` condition.",
+      "truth": "There is a second consequence of the unconditional `if (clinicId) where.clinicId = clinicId` at L382 that the extraction treats only as a shape quirk: it OVERWRITES the staff-validated clinic set at L372. A user with an active ClinicStaff row at clinic A who sends `X-Clinic-Id: A` and `?clinicId=B` passes the staff check on A, then has where.clinicId silently replaced with B and never re-validated — they receive clinic B's appointments, patientUser-enriched with displayName and phone. The port must reproduce the overwrite for byte-identity; flag it separately as an authorization defect.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /",
+      "claim": "Endpoint is described as an uncached list of appointments.",
+      "truth": "It is wrapped in `cacheMiddleware(15)` (L352) and the cache key is `route:${userId}:${req.originalUrl}` (server/src/lib/cacheMiddleware.js L28) — it does NOT include the X-Clinic-Id header, which this handler branches on at L369. The client sets that header globally and mutates it on context switch (client/src/contexts/UserContextProvider.jsx L93, L111), re-requesting the SAME url. So for up to 15 seconds after switching clinics, a staff user is served the PREVIOUS clinic's appointment array from cache. This 15s stale window is part of the observed Node contract; GET /today is cached the same way (L511) but is physician-scoped so it is benign there. The middleware caches the JS object and re-serializes it, so bytes are identical to a fresh response.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /",
+      "claim": "Shape lists Appointment scalars; relation payloads not fully expanded in the extraction text I was given.",
+      "truth": "Authoritative include (L393-L400) plus the enrichment spread (L414). Full top-level key order: the 22 Appointment scalars (id, clinicId, physicianId, patientUserId, subprofileId, clinicPatientId, status, appointmentDate, startTime, endTime, reason, notes, appointmentType, confirmedAt, completedAt, cancelledAt, cancelReason, recurringRule, recurringGroupId, createdAt, updatedAt, deletedAt), then `clinic: { id, name, address, phone }`, `physician: { specialty, user: { displayName } }` — NOTE physician has NO id here — `subprofile: { name, relation } | null` where relation is the SubprofileRelation enum (SELF|SPOUSE|CHILD|PARENT|SIBLING|OTHER), and finally `patientUser: { id, displayName, phone } | null` appended last by the spread, present only on the enriched branch. `take: 200` (L401) is a hard silent cap with no pagination metadata and no total.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /",
+      "claim": "Query params status/date/clinicId are filters.",
+      "truth": "Neither is validated. `where.status = status` passes the raw string to Prisma (L379); anything outside AppointmentStatus (PENDING|CONFIRMED|COMPLETED|CANCELLED|NO_SHOW) throws a PrismaClientValidationError caught by the outer catch → 500 {\"error\":\"Failed to list appointments\"}, never 400. Same for an unparseable `?date=`: `new Date(date)` → Invalid Date → setHours on Invalid Date → Prisma throws → 500 (L380-L386). Note also the date window is built with `setHours(0,0,0,0)` / `(23,59,59,999)` in SERVER-LOCAL time while `?date=YYYY-MM-DD` parses as UTC midnight — a .NET port using UTC day boundaries will select a different row set on any server whose offset is not 0.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /today",
+      "claim": "clinic is `{ name }` only; patientUser is `{ id, displayName }`; no physician key.",
+      "truth": "All three check out, but a relation is missing from the list: the include at L527-L530 is `clinic: { select: { name } }` AND `subprofile: { select: { name, relation } }`. Row key order is the 22 scalars, then `clinic`, `subprofile`, then `patientUser` from the spread at L543. Omitting `subprofile` drops the family-member label the client renders for a child's appointment.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "POST /",
+      "claim": "201 body listed as Appointment scalars only (visible portion), quirks silent on relations.",
+      "truth": "The create carries an include (L475-L479), so the 201 body is the 22 scalars followed by `clinic: { name }`, `physician: { user: { displayName } }` and `subprofile: { name, relation } | null`. Critically `physician` here does NOT contain `specialty`, unlike GET / — the two are different DTOs for the same relation name.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "POST /",
+      "claim": "409 'This slot is already booked' guards double-booking.",
+      "truth": "The guard (L465-L472) filters on physicianId + local day window + exact `startTime` string equality + status in PENDING/CONFIRMED, and is NOT scoped to clinicId. So (a) a booking at physician P's clinic A blocks the same startTime at clinic B, returning 409 for a slot the client just showed as free by GET /available; (b) overlapping-but-not-identical times (09:00-09:30 vs 09:15-09:45) are never detected — endTime is ignored entirely; (c) it is a check-then-create with no transaction or unique index, so two concurrent requests both pass and both 201.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /",
+      "claim": "subprofileId is passed through to the row.",
+      "truth": "`subprofileId: subprofileId || null` (L486) is written with NO ownership validation — nothing verifies the subprofile belongs to the caller's PatientProfile. Any authenticated patient can attach an arbitrary FamilySubprofile id, and GET / then echoes that stranger's `subprofile: { name, relation }` back in the list (and POST /'s own 201 body, and the notification text at L497 `(for ${appointment.subprofile.name})`). Also: subprofileId DOES carry an FK (SetNull), so a nonexistent id is a Prisma FK error → 500 'Failed to book appointment', not 400 — unlike patientUserId, which has no FK at all.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /walk-in",
+      "claim": "201 body listed as scalars; quirks cover the physician-precedence and 404-unreachable issues.",
+      "truth": "The create has `include: { clinic: { select: { name: true } } }` (L599), so the 201 body is the 22 scalars followed by a `clinic: { name }` key — the only relation on this route (no physician, no subprofile, even when subprofileId was supplied). Also fixed by the handler and not visible in the extraction excerpt: `reason` defaults to the literal string 'Walk-in' (L596, never null), `notes` is the literal 'WALK_IN' (L597), `confirmedAt` is `now` (never null on this route), and `endTime` falls back to `resolvedStart` (L588) producing a zero-length appointment. One more 500 path: `new Date(appointmentDate + 'T12:00:00')` (L585) yields Invalid Date if the client sends a full ISO timestamp instead of YYYY-MM-DD → Prisma throws → 500 'Failed to create walk-in'.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /available",
+      "claim": "isBooked marks slots taken for the requested physician/clinic/date.",
+      "truth": "The booked query at L311-L316 filters on physicianId + day window + status in PENDING/CONFIRMED and has NO clinicId filter, even when ?clinicId was supplied and used to filter the slots. An appointment at the physician's OTHER clinic at the same startTime marks this clinic's slot isBooked:true. Matching is by exact startTime string only (`new Set(booked.map(b => b.startTime))`, L320) — endTime is selected but never used, so overlaps are invisible.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /available",
+      "claim": "Three not-allowed outcomes return 200 [] (only two are then named); the date is parsed as server-local noon.",
+      "truth": "Two further behaviours change the payload. (a) The day window is `new Date(date+'T00:00:00')` / `new Date(date+'T23:59:59.999')` (L307-L308) — SERVER-LOCAL — while POST / stores `appointmentDate: new Date(appointmentDate)` (L488) = UTC midnight. On a server with a negative UTC offset (e.g. UTC-5) the stored UTC-midnight row falls OUTSIDE the local-day window, so isBooked is silently always false and the client offers already-booked slots. (b) `new Date(date + 'T12:00:00')` (L293) is Invalid Date for a full ISO input → `getDay()` is NaN → `dayOfWeek: NaN` reaches Prisma → 500 'Failed to check availability', not 400. Also the dedupe at L323-L328 keeps the FIRST row per startTime under `orderBy: { startTime: 'asc' }` only, so with clinicId omitted the surviving row's clinicId/clinic.name is arbitrary among duplicates.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /ai-optimize",
+      "claim": "Endpoint status listed as 200 with two 200 branches (<5 appointments, and normal).",
+      "truth": "There is a third outcome the status column omits: 403 {\"error\":\"Only physicians can access scheduling insights\"} when the caller has no PhysicianProfile (L1333-L1335). This is the ONLY GET in the router that 403s — GET /slots, GET /today and GET / all silently return [] for the same caller. A port that harmonises them either way breaks one of the two clients.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /ai-optimize",
+      "claim": "All rates are fractions 0..1 via parseFloat(x.toFixed(3)).",
+      "truth": "Three exceptions in `stats`: (a) `slotUtilization` is additionally clamped — `Math.min(slotUtilization, 1)` (L1473) — so it saturates at exactly 1 and can never exceed it, and `1` serializes as the integer 1, not 1.0; (b) `avgDailyPatients` uses toFixed(**1**), not (3) (L1440); (c) `avgVisitDurationMin` is not a rate at all — `Math.round`ed int or **null** (L1425-L1433), null when there are no COMPLETED visits with completedAt in the window or when every computed duration is outside the exclusive (0, 300) minute band. `avgSlotDuration` falls back to the literal 30 when there are no active slots (L1462).",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /ai-optimize",
+      "claim": "Normal branch is { stats, insights, aiProvider }.",
+      "truth": "Correct envelope, but three payload details a port will get wrong: (a) `typeBreakdown` (L1466-L1470) is a sparse object keyed only by the AppointmentType values actually present — an absent type has NO key, it is not 0, so a .NET Dictionary pre-seeded with all four types diverges; (b) `hourDistribution` is sorted by `a.hour.localeCompare(b.hour)` on the string '9:00' style value (L1420-L1422) — safe only because startTime is zero-padded in practice; any unpadded startTime row sorts '9:00' AFTER '10:00'; (c) `aiProvider` is `null` when the aiGateway call itself throws (L1481 initialiser, catch at L1544) but a real provider string when the call succeeded and only JSON parsing failed (L1495 assigned before the inner try) — in both cases `insights` is `[]`. `insights` is always an array, never null, and is capped at 6 by `.slice(0, 6)` (L1516) despite the prompt asking for 3-5.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /recurring",
+      "claim": "count clamping, empty-array case and groupId rename are covered.",
+      "truth": "Three omissions. (a) There is NO duplicate/conflict check — unlike POST /, this route can create a series straight on top of existing PENDING/CONFIRMED appointments and never returns 409. (b) There is no notification of any kind, unlike POST /. (c) The 1-12 creates are sequential awaits with no transaction (L714-L727), so a failure on occurrence k returns 500 'Failed to create recurring appointments' with k-1 orphan rows already persisted under a groupId the client never learns. Also `date.setDate(date.getDate() + (i * intervalDays))` (L717) mutates in SERVER-LOCAL time on a value parsed as UTC midnight, so a DST transition inside the series shifts the stored UTC time-of-day of later occurrences by an hour — a .NET port using UTC date arithmetic produces different appointmentDate values.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /slots/sync-from-hours",
+      "claim": "Destructive deleteMany, double-encoded workingHours, count-can-be-0 are covered.",
+      "truth": "Two additions. (a) The deleteMany (L200-L202) is scoped to physicianId + clinicId ONLY — it wipes EVERY dayOfWeek for the clinic, not just the days present in the posted schedule, and carries no isActive filter so it hard-deletes soft-deleted rows too. A schedule containing only Monday therefore erases Tue-Sun. (b) Malformed entries are silently skipped: `if (dayOfWeek === undefined || !startTime || !endTime) continue` (L208) — so a partially-bad schedule still returns 200 with a lower `count` after the wipe, and the clinic's `workingHours` is nonetheless overwritten with `JSON.stringify(schedule)` of the RAW request body including the skipped entries (L240). Per-entry slotDuration defaults to **15** here (L210) vs **30** in /slots/bulk and POST /slots.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "PUT /:id/complete",
+      "claim": "This is the ONLY status transition among confirm/cancel/complete that sends no notification.",
+      "truth": "True as scoped but misleading as a port instruction: PUT /:id/no-show (L894-L922) also sends no notification. Two of the four transitions are silent, and the port should not infer that no-show notifies.",
+      "severity": "cosmetic"
+    },
+    {
+      "endpoint": "PUT /:id/cancel",
+      "claim": "Notification branch selection and the U+2014 em dash are covered.",
+      "truth": "One shape-adjacent omission: `cancelReason: reason || null` (L822) is taken from the body with no length limit and no sanitisation, and `reason` is then interpolated into the notification message; an empty-string reason is stored as null, so the response's `cancelReason` is null while the client believes it sent a reason. Also the authorization set here is wider than confirm/complete/no-show — it includes `isPatient` (L816) — so a patient can cancel but cannot confirm or complete.",
+      "severity": "cosmetic"
+    }
+  ],
+  "routeOrderHazards": [
+    "slots — literal first segment. `DELETE /api/appointments/slots/{id}` (L96) is registered 832 lines before `DELETE /api/appointments/{id}` (L928). Segment counts differ so ASP.NET will not confuse the two, but note the live Node behaviour that a port must not accidentally change: `DELETE /api/appointments/slots` with no id has no route of its own and binds to `DELETE /{id}` with id=\"slots\", returning 404 {\"error\":\"Appointment not found\"} — not 404 from a route miss and not 405.",
+    "slots — also the first segment of `GET /slots` (L28) and `POST /slots` (L57). There is no `GET /{id}` or `PUT /{id}` or `POST /{id}` in the Node router today, so nothing currently swallows them; the hazard is that .NET ports almost always add `GET /{id}`, and the moment one exists `slots`, `today`, `queue`, `available` and `ai-optimize` must be mapped first (or as literal-precedence attribute routes) or they bind as the id.",
+    "slots/bulk — `POST /api/appointments/slots/bulk` (L126) shares a segment count with `POST /api/appointments/{id}/intake-note` (L1126). Only the differing second literal keeps them apart; any `POST /{id}/{action}` catch-all in the port swallows it.",
+    "slots/sync-from-hours — same two-segment collision class as slots/bulk against `POST /{id}/intake-note`.",
+    "available — `GET /available` (L258), must precede any `GET /{id}`.",
+    "today — `GET /today` (L511), must precede any `GET /{id}`.",
+    "queue — `GET /queue` (L1210), must precede any `GET /{id}`. Note it is registered near the END of the Node file yet still wins because no GET /{id} exists — a port that reorders and adds GET /{id} silently turns it into an appointment lookup that 404s.",
+    "ai-optimize — `GET /ai-optimize` (L1328), same as above, and it is the very last registration in the file.",
+    "walk-in — `POST /walk-in` (L556), must precede any `POST /{id}`.",
+    "recurring — `POST /recurring` (L700), must precede any `POST /{id}`.",
+    "confirm, cancel, complete, no-show, check-in — second-segment literals in `PUT /{id}/<literal>` (L741, L789, L859, L894, L966). These must be mapped as literals, never as a `PUT /{id}/{action}` catch-all; note the kebab-case spellings `no-show` and `check-in` exactly (client-endpoints.txt confirms PUT /appointments/:param/no-show and /check-in).",
+    "intake-note — second-segment literal in `POST /{id}/intake-note` (L1126); kebab-case, and it must not be reachable as `POST /{id}/{anything}`."
+  ],
+  "verdict": "The extraction is strong on the slot-management routes and on the status-transition family, and its more colourful quirks (destructive-then-fail in /slots/bulk, the double-encoded workingHours, the dead update branch in intake-note, the DELETE-is-an-UPDATE asymmetry, the silent-200-[] gates, the U+2014 em dash) all check out against the code. But it is not yet safe to port from. One whole route is missing — POST /slots at L57-L88, the only registration of the 20 in the file that was omitted; it is not called by the React client, so it is a parity gap rather than a client bug. Beyond that, the material problems cluster in three places. First, response shapes are under-expanded in exactly the endpoints that reshape most: PUT /:id/check-in has three extra top-level keys (message, checkedInBy, payment) with payment silently null on a repeat check-in; GET /queue rows carry four more (visitStatus, visitFollowUp, visitFollowUpNotes, visitCompletedAt) whose names differ from the model fields; GET /today omits subprofile; POST / and POST /walk-in each ship relation objects (and POST /'s physician DTO differs from GET /'s for the same relation name). Second, one enum domain is flatly wrong and it came from a wrong comment in the source: GET /queue's visitStatus can be CANCELLED or ARCHIVED, not just IN_PROGRESS/COMPLETED, because the Visit query applies no status filter (L1273-1282, comment at L1294). Third, two behaviours that live outside the handler body will diverge invisibly in .NET: GET / is wrapped in cacheMiddleware(15) whose cache key excludes the X-Clinic-Id header the handler branches on, so a staff clinic switch serves the previous clinic's array for 15 seconds; and POST /:id/intake-note relies on PostgreSQL treating NULLs as distinct in PatientNote's @@unique([physicianUserId, patientUserId, subprofileId]) — on SQL Server the second intake note for a physician-patient pair will raise a duplicate key and return 500 where Node returns 200. Also worth correcting: GET /ai-optimize has a 403 branch the status column does not mention, its slotUtilization is clamped by Math.min(x,1) and avgDailyPatients is 1-decimal (so 'all rates are 3-decimal fractions' is wrong), avgVisitDurationMin is nullable, and typeBreakdown is a sparse object. Timezone handling is the systemic risk across the file: GET /available builds its day window in server-local time while POST / stores UTC midnight, so isBooked silently fails on any negative-offset server; and POST /recurring advances dates with local-time setDate, which shifts stored UTC times across a DST boundary. Route ordering itself is currently benign in Node because no GET/PUT/POST /{id} route exists at all — the hazard is entirely prospective, and the literal segments listed above must be given precedence the moment the port adds one."
+}

@@ -1,0 +1,283 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/",
+      "nodeLines": "L352-L423",
+      "summary": "Lists appointments for the caller. Three role branches decided in-handler: PHYSICIAN (by JWT userType) -> own appointments by physicianProfile.id; non-physician WITH a resolvable staff clinic (X-Clinic-Id header or ?clinicId) -> all appointments of that clinic; everyone else -> own bookings by patientUserId. Optional status/date/clinicId filters, ordered by appointmentDate asc, hard-capped at 200 rows. Physician and clinic-staff branches get a batch patientUser enrichment appended to each row.",
+      "auth": "Global: helmet, compression, cors, body sanitizer, express-rate-limit 100 req/min per IP on /api. Router: authCheck (L18, JWT Bearer -> req.user = {id,email,role,userType,displayName,organizationId,iat,exp}). Route: cacheMiddleware(15). In-handler gate: req.user.userType === 'PHYSICIAN' string compare, else prisma.clinicStaff.findFirst({userId, clinicId: req.headers['x-clinic-id'] || query.clinicId, isActive:true}); NO aiUsageCheck, NO auditLog.",
+      "successStatus": 200,
+      "requestQuery": [
+        "status?: string - passed straight through to prisma as AppointmentStatus enum, NOT validated ('PENDING'|'CONFIRMED'|'COMPLETED'|'CANCELLED'|'NO_SHOW')",
+        "date?: string - any Date-parseable string; used as `new Date(date)` then setHours(0,0,0,0) / setHours(23,59,59,999) in SERVER LOCAL time",
+        "clinicId?: string - doubles as the staff-clinic resolver AND as an extra where filter applied after the branch logic"
+      ],
+      "requestBody": [],
+      "responseShape": "// Branch A - userType==='PHYSICIAN' OR staff clinic resolved (where.clinicId set): JSON array (possibly empty), each element:\n[\n  {\n    \"id\": \"uuid\",\n    \"clinicId\": \"uuid\",\n    \"physicianId\": \"uuid\",\n    \"patientUserId\": \"uuid\",\n    \"subprofileId\": \"uuid | null\",\n    \"clinicPatientId\": \"uuid | null\",\n    \"status\": \"PENDING | CONFIRMED | COMPLETED | CANCELLED | NO_SHOW\",\n    \"appointmentDate\": \"2026-03-10T00:00:00.000Z\",   // ISO-8601 UTC string w/ ms (Date.toJSON)\n    \"startTime\": \"09:00\",                             // plain string, NOT a time type\n    \"endTime\": \"09:30\",                               // plain string\n    \"reason\": \"string | null\",\n    \"notes\": \"string | null\",                         // may contain 'WALK_IN' and/or '\\nCHECKIN:{json}' markers\n    \"appointmentType\": \"IN_PERSON | VIDEO | PHONE | WALK_IN\",\n    \"confirmedAt\": \"ISO string | null\",\n    \"completedAt\": \"ISO string | null\",\n    \"cancelledAt\": \"ISO string | null\",\n    \"cancelReason\": \"string | null\",\n    \"recurringRule\": \"string | null\",                 // 'WEEKLY'|'BIWEEKLY'|'MONTHLY'|null, free-text column\n    \"recurringGroupId\": \"uuid | null\",\n    \"createdAt\": \"ISO string\",\n    \"updatedAt\": \"ISO string\",\n    \"deletedAt\": \"ISO string | null\",                 // soft-delete column IS emitted and NOT filtered\n    \"clinic\": { \"id\": \"uuid\", \"name\": \"string\", \"address\": \"string | null\", \"phone\": \"string | null\" },\n    \"physician\": { \"specialty\": \"string\", \"user\": { \"displayName\": \"string\" } },\n    \"subprofile\": { \"name\": \"string\", \"relation\": \"SELF|SPOUSE|CHILD|PARENT|SIBLING|OTHER\" } | null,\n    \"patientUser\": { \"id\": \"uuid\", \"displayName\": \"string\", \"phone\": \"string | null\" } | null\n  }\n]\n\n// Branch B - non-physician, no staff clinic resolved and no ?clinicId: IDENTICAL element shape\n// EXCEPT the \"patientUser\" key is ABSENT ENTIRELY (not null). clinic/physician/subprofile still present.\n\n// Branch C - userType==='PHYSICIAN' but no PhysicianProfile row: literally []\n\n// Key order (matters for byte-identical JSON): all Appointment scalars in prisma schema order,\n// then clinic, physician, subprofile (include declaration order), then patientUser appended last by the spread.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing or not 'Bearer '-prefixed",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws (bad signature, expired)",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter (100/min/IP)",
+        "500 {\"error\":\"Failed to list appointments\"} on any thrown error - INCLUDING an invalid ?status value (prisma enum validation) and an unparseable ?date (Invalid Date reaches prisma). There is NO 400 validation on this route."
+      ],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "ClinicStaff (findFirst - userId + clinicId + isActive)",
+        "Clinic (via include: id, name, address, phone)",
+        "User (findMany by id IN - id, displayName, phone)",
+        "FamilySubprofile (via include: name, relation)"
+      ],
+      "externalDeps": [
+        "cacheMiddleware / lib/cache (in-process Map, 15s TTL)",
+        "lib/logger (pino)"
+      ],
+      "sideEffects": [
+        "Writes the successful response object into the in-process cache under key `route:{userId}:{req.originalUrl}` for 15s",
+        "Request log line via logger.info in the global middleware"
+      ],
+      "quirks": [
+        "RESPONSE-SHAPE FORK: `patientUser` is present (object-or-null) for physicians and clinic-staff, and COMPLETELY ABSENT for a plain patient. A .NET port that always emits patientUser:null changes the payload for patient callers.",
+        "`patientUser` also appears for a PATIENT caller who merely passes ?clinicId=... - the enrichment condition is `userType==='PHYSICIAN' || where.clinicId`, and where.clinicId gets set by the unconditional `if (clinicId) where.clinicId = clinicId` at the end, regardless of staff membership. So a patient with ?clinicId gets their own name/phone echoed back.",
+        "Missing PhysicianProfile for a PHYSICIAN returns 200 [] - not 404, not 403.",
+        "Silent `take: 200` cap with no total/hasMore/pagination signal. The 201st appointment simply does not exist to the client.",
+        "The ?date day-boundary is computed as `new Date(date)` (UTC-midnight for a bare 'YYYY-MM-DD') then `.setHours(0,0,0,0)` in SERVER LOCAL time. On a server west of UTC this shifts the window to the PREVIOUS calendar day. Note this differs from GET /available which uses `new Date(date+'T00:00:00')` (local midnight directly) - the two endpoints disagree about what 'that day' means.",
+        "Staff clinic id is read from the lowercased header `x-clinic-id` FIRST, falling back to ?clinicId.",
+        "A non-physician who sends a clinic id but is NOT active staff silently falls back to `where.patientUserId = userId` - a 200 with their own (usually empty) list, never a 403.",
+        "CACHE KEY IGNORES THE HEADER: cacheMiddleware keys on `route:{userId}:{originalUrl}` only. A staff member switching clinics via X-Clinic-Id with an identical URL gets the OTHER clinic's cached list for up to 15s. Nothing in this router calls cache.invalidate, so POST / (booking) or PUT /:id/confirm also do not bust the 15s cache.",
+        "The cache is a per-process in-memory Map, so under PM2 cluster mode different workers return different generations of the same list.",
+        "`deletedAt` is returned and soft-deleted rows are NOT filtered out anywhere in this handler (no prisma soft-delete middleware exists - server/src/lib/prisma.js is a bare PrismaClient).",
+        "userType comes from the JWT payload, not from a live DB read - a stale token role decides the branch.",
+        "`physician.specialty` is exposed but `physician.id`/`userId` are not; the client cannot correlate the physician object back to an id from this endpoint.",
+        "Ordering is `appointmentDate: 'asc'` only - appointments on the same date come back in unspecified order (startTime is NOT a tiebreaker here, unlike /today and /queue).",
+        "startTime/endTime are strings ('09:00'); any sorting or comparison must be lexicographic, and a non-zero-padded value like '9:00' would sort after '10:00'."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/today",
+      "nodeLines": "L511-L550",
+      "summary": "Physician-only today's schedule. Resolves PhysicianProfile from req.user.id, fetches PENDING+CONFIRMED appointments whose appointmentDate falls in the server-local calendar day, ordered by the startTime STRING, then appends a batch-loaded patientUser {id,displayName} to each row. Any caller without a PhysicianProfile gets [].",
+      "auth": "Global: helmet/compression/cors/sanitizer + 100 req/min/IP on /api. Router: authCheck (L18). Route: cacheMiddleware(15). In-handler gate: existence of prisma.physicianProfile for req.user.id - NOT a userType check, and NO explicit 403. NO aiUsageCheck, NO auditLog.",
+      "successStatus": 200,
+      "requestQuery": [],
+      "requestBody": [],
+      "responseShape": "// JSON array (possibly empty), each element:\n[\n  {\n    \"id\": \"uuid\",\n    \"clinicId\": \"uuid\",\n    \"physicianId\": \"uuid\",\n    \"patientUserId\": \"uuid\",\n    \"subprofileId\": \"uuid | null\",\n    \"clinicPatientId\": \"uuid | null\",\n    \"status\": \"PENDING | CONFIRMED\",                  // only these two can appear (where-filtered)\n    \"appointmentDate\": \"2026-09-03T00:00:00.000Z\",     // ISO-8601 UTC string w/ ms\n    \"startTime\": \"09:00\",\n    \"endTime\": \"09:30\",\n    \"reason\": \"string | null\",\n    \"notes\": \"string | null\",\n    \"appointmentType\": \"IN_PERSON | VIDEO | PHONE | WALK_IN\",\n    \"confirmedAt\": \"ISO string | null\",\n    \"completedAt\": \"ISO string | null\",\n    \"cancelledAt\": \"ISO string | null\",\n    \"cancelReason\": \"string | null\",\n    \"recurringRule\": \"string | null\",\n    \"recurringGroupId\": \"uuid | null\",\n    \"createdAt\": \"ISO string\",\n    \"updatedAt\": \"ISO string\",\n    \"deletedAt\": \"ISO string | null\",\n    \"clinic\": { \"name\": \"string\" },                    // NAME ONLY - no id, no address, no phone\n    \"subprofile\": { \"name\": \"string\", \"relation\": \"SELF|SPOUSE|CHILD|PARENT|SIBLING|OTHER\" } | null,\n    \"patientUser\": { \"id\": \"uuid\", \"displayName\": \"string\" } | null   // NO phone here\n  }\n]\n\n// Key order: Appointment scalars in schema order, then clinic, then subprofile, then patientUser (spread, last).\n// There is NO \"physician\" key on this endpoint.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing/malformed",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global limiter",
+        "500 {\"error\":\"Failed to get today schedule\"} on any thrown error",
+        "NOTE: no 403 and no 404 exist on this route - a patient or receptionist gets 200 []"
+      ],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "Clinic (via include: name only)",
+        "FamilySubprofile (via include: name, relation)",
+        "User (findMany by id IN - id, displayName)"
+      ],
+      "externalDeps": [
+        "cacheMiddleware / lib/cache (15s TTL, key includes no query so it is just `route:{userId}:/api/appointments/today`)",
+        "lib/logger"
+      ],
+      "sideEffects": [
+        "Caches the response for 15s under `route:{userId}:/api/appointments/today`",
+        "Global request log line"
+      ],
+      "quirks": [
+        "A non-physician (patient, receptionist) gets 200 [] rather than 403. The endpoint is 'physician-only' by silent fallthrough.",
+        "clinic here is `{ name }` ONLY - deliberately narrower than GET / which returns {id,name,address,phone}. Do not reuse one DTO for both.",
+        "patientUser here is `{ id, displayName }` with NO phone - GET / includes phone, GET /queue includes phone but NOT id. Three different patient shapes across the three list endpoints.",
+        "No `physician` key at all on this endpoint.",
+        "`orderBy: { startTime: 'asc' }` sorts the STRING column, so a non-zero-padded '9:00' sorts after '10:00'. Must be replicated as an ordinal string sort, not a parsed-time sort.",
+        "Day window is built from server local time: `new Date(y, m, d)` .. `new Date(y, m, d, 23,59,59,999)`. The comparison against a UTC-stored DateTime means 'today' is the server's timezone day, not the physician's or the client's.",
+        "Only PENDING and CONFIRMED are returned - COMPLETED, CANCELLED and NO_SHOW appointments vanish from today's list once acted on. (Contrast GET /queue, which keeps COMPLETED and NO_SHOW.)",
+        "Soft-deleted rows (deletedAt != null) are still returned, and deletedAt is emitted.",
+        "patientUser is `null` when the patient User row is missing (deleted user) - the array element still appears.",
+        "The endOfDay ms component is 999, so an appointmentDate at exactly 23:59:59.9995 would be excluded; port must use lte with .999.",
+        "Nothing invalidates the 15s cache, so a check-in or confirm made in the same window is invisible to /today for up to 15s."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/queue",
+      "nodeLines": "L1210-L1315",
+      "summary": "Today's clinic-wide patient queue for staff/assistants. Requires ?clinicId. Access = physician who OWNS that clinic, or active ClinicStaff there. Returns today's PENDING/CONFIRMED/COMPLETED/NO_SHOW appointments for the clinic, ordered by startTime string, each enriched with patientUser, check-in state parsed out of the free-text notes column, and today's Visit status overlaid. Wrapped in { queue, summary }.",
+      "auth": "Global: helmet/compression/cors/sanitizer + 100 req/min/IP. Router: authCheck (L18). NO cacheMiddleware on this route. In-handler gate: prisma.physicianProfile.findUnique({where:{userId}, include:{clinics:{where:{id:clinicId}, take:1}}}) -> isPhysician = physician && physician.clinics.length > 0; else prisma.clinicStaff.findFirst({userId, clinicId, isActive:true}); 403 if neither. NO aiUsageCheck, NO auditLog.",
+      "successStatus": 200,
+      "requestQuery": [
+        "clinicId: string (REQUIRED - 400 if missing/empty)"
+      ],
+      "requestBody": [],
+      "responseShape": "{\n  \"queue\": [\n    {\n      // --- Appointment scalars, prisma schema order ---\n      \"id\": \"uuid\",\n      \"clinicId\": \"uuid\",\n      \"physicianId\": \"uuid\",\n      \"patientUserId\": \"uuid\",\n      \"subprofileId\": \"uuid | null\",\n      \"clinicPatientId\": \"uuid | null\",\n      \"status\": \"PENDING | CONFIRMED | COMPLETED | NO_SHOW\",   // CANCELLED never appears\n      \"appointmentDate\": \"2026-09-03T00:00:00.000Z\",\n      \"startTime\": \"09:00\",\n      \"endTime\": \"09:30\",\n      \"reason\": \"string | null\",\n      \"notes\": \"string | null\",                  // raw, still containing 'WALK_IN' / 'CHECKIN:{...}'\n      \"appointmentType\": \"IN_PERSON | VIDEO | PHONE | WALK_IN\",\n      \"confirmedAt\": \"ISO string | null\",\n      \"completedAt\": \"ISO string | null\",\n      \"cancelledAt\": \"ISO string | null\",\n      \"cancelReason\": \"string | null\",\n      \"recurringRule\": \"string | null\",\n      \"recurringGroupId\": \"uuid | null\",\n      \"createdAt\": \"ISO string\",\n      \"updatedAt\": \"ISO string\",\n      \"deletedAt\": \"ISO string | null\",\n\n      // --- includes, in declaration order ---\n      \"subprofile\": { \"name\": \"string\", \"relation\": \"SELF|SPOUSE|CHILD|PARENT|SIBLING|OTHER\" } | null,\n      \"physician\": {                              // full include -> EVERY PhysicianProfile scalar\n        \"id\": \"uuid\",\n        \"userId\": \"uuid\",\n        \"licenseNumber\": \"string\",\n        \"specialty\": \"string\",\n        \"qualifications\": \"string | null\",\n        \"bio\": \"string | null\",\n        \"scratchpadNotes\": \"string | null\",       // private physician scratchpad LEAKS to staff here\n        \"yearsOfExperience\": 0,                    // int | null\n        \"verified\": false,\n        \"verifiedAt\": \"ISO string | null\",\n        \"createdAt\": \"ISO string\",\n        \"updatedAt\": \"ISO string\",\n        \"user\": { \"displayName\": \"string\" }\n      },\n\n      // --- appended by the first map (spread order) ---\n      \"patientUser\": { \"displayName\": \"string\", \"phone\": \"string | null\" } | null,  // NO id\n      \"checkedIn\": false,                          // boolean, derived from notes\n      \"checkedInAt\": \"2026-09-03T08:41:12.113Z\",   // STRING copied verbatim out of the notes JSON, or null\n      \"room\": \"string | null\",                     // whatever was stored in the notes JSON (may be any JSON type)\n\n      // --- appended by the visit-overlay map ---\n      \"visitStatus\": \"IN_PROGRESS | COMPLETED | CANCELLED | ARCHIVED | null\",\n      \"visitFollowUp\": \"ISO string | null\",        // <- Visit.followUpDate, RENAMED\n      \"visitFollowUpNotes\": \"string | null\",       // <- Visit.followUpNotes, RENAMED\n      \"visitCompletedAt\": \"ISO string | null\"      // <- Visit.completedAt, RENAMED\n    }\n  ],\n  \"summary\": {\n    \"total\": 0,\n    \"arrived\": 0,\n    \"pending\": 0,\n    \"completed\": 0,\n    \"noShow\": 0\n  }\n}\n\n// \"queue\" is [] (never null) when the clinic has no appointments today; \"summary\" is then all zeros.",
+      "errorCases": [
+        "400 {\"error\":\"clinicId required\"} when ?clinicId is missing or falsy",
+        "403 {\"error\":\"Not staff at this clinic\"} when the caller is neither the owning physician of that clinic nor an active ClinicStaff row for it",
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global limiter",
+        "500 {\"error\":\"Failed to load queue\"} on any thrown error"
+      ],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId, include filtered clinics relation; then FULL scalar set exposed via the appointment include)",
+        "Clinic (only as the filtered `clinics` relation used for the ownership check)",
+        "ClinicStaff (findFirst - userId + clinicId + isActive)",
+        "User (findUnique per appointment - displayName, phone)",
+        "FamilySubprofile (via include: name, relation)",
+        "Visit (findMany - id, patientUserId, status, followUpDate, followUpNotes, completedAt)"
+      ],
+      "externalDeps": [
+        "lib/logger"
+      ],
+      "sideEffects": [
+        "None (pure read). Not cached.",
+        "Global request log line"
+      ],
+      "quirks": [
+        "RESPONSE IS AN ENVELOPE `{queue, summary}` - unlike GET / and GET /today which return bare arrays.",
+        "There is NO `clinic` key on queue rows even though clinicId is required - the client already knows the clinic. Do not add one.",
+        "`physician` is a FULL prisma `include` (no select), so every PhysicianProfile scalar ships to every receptionist, including `bio` and `scratchpadNotes` (the physician's private notes) and `licenseNumber`. A faithful port MUST emit all of these or the JSON differs; flag it separately as a data-exposure issue rather than silently trimming.",
+        "`patientUser` here is `{displayName, phone}` with NO `id` - different from GET / ({id,displayName,phone}) and GET /today ({id,displayName}).",
+        "RESPONSE KEY RENAMES: visitFollowUp <- Visit.followUpDate, visitFollowUpNotes <- Visit.followUpNotes, visitCompletedAt <- Visit.completedAt. The Visit's own `id` IS selected from the DB but is NEVER emitted - it is dropped by the merge.",
+        "checkedIn/checkedInAt/room are reverse-engineered from the free-text `notes` column: trigger is `notes.includes('CHECKIN:')`, payload is `notes.split('CHECKIN:').pop()` (LAST occurrence wins) parsed as JSON. On JSON.parse failure the catch sets checkedIn = true but LEAVES checkedInAt = null and room = null - i.e. 'checked in at unknown time'. Port must copy this partial-success path exactly.",
+        "checkedInAt is a STRING carried straight out of the notes JSON (written as `new Date().toISOString()` by PUT /:id/check-in), NOT a re-serialized Date. It is not normalized or validated, and its format therefore does not necessarily match the Date-derived ISO fields next to it.",
+        "`room` is whatever JSON value was stored (normally a string or null, but a numeric room from the client stays numeric). Do not coerce it to string.",
+        "Visit overlay is keyed only by patientUserId with NO orderBy on the visit query, so when one patient has MULTIPLE visits today the LAST row returned by the DB wins - non-deterministic. Also the overlay is not scoped to the appointment, so a walk-in visit attaches to an unrelated appointment row of the same patient.",
+        "Visit overlay does not filter Visit.deletedAt or Visit.physicianId - any visit at that clinic today for that patient matches, including a soft-deleted one and one by a different physician.",
+        "SUMMARY BUCKETS OVERLAP AND DO NOT SUM TO total: `pending` = !checkedIn && status !== 'COMPLETED', so a NO_SHOW that was never checked in is counted in BOTH `pending` and `noShow`; and a checked-in NO_SHOW counts in both `arrived` and `noShow`. Reproduce the predicates literally, do not 'fix' the arithmetic.",
+        "`arrived` counts the notes-derived checkedIn flag, not appointment status - a CONFIRMED appointment with no CHECKIN marker is not 'arrived'.",
+        "CANCELLED is excluded from the status filter, so cancelled appointments silently disappear from the queue and from every summary count.",
+        "N+1 by design: one `prisma.user.findUnique` per appointment inside Promise.all. Result order is preserved by map, so output order still follows the startTime sort - a batched .NET implementation must preserve that same order.",
+        "Physician ownership check uses the filtered `clinics` relation (`clinics.length > 0`), so a physician querying a clinic they do not own falls through to the STAFF check and can still pass if they happen to be staff there.",
+        "Day window uses server-local `new Date(y,m,d)` .. `(y,m,d,23,59,59,999)` for BOTH appointments and visits.",
+        "`orderBy: { startTime: 'asc' }` is a string sort (same padding caveat as /today).",
+        "Not cached - fresh on every call, unlike / and /today.",
+        "There is no GET /:id route anywhere in this router, so /queue and /ai-optimize (both declared AFTER `router.delete('/:id')`) are NOT shadowed. A .NET port that adds a `GET /{id}` route WILL shadow /queue, /today, /available and /ai-optimize unless the literal routes are registered first."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/available",
+      "nodeLines": "L258-L341",
+      "summary": "Returns a physician's recurring TimeSlot template for the weekday of a given date, each slot flagged isBooked. Requires physicianUserId + date; clinicId optional. If the clinic has allowPatientBooking=false, only the physician themselves or active clinic staff may see slots - anyone else gets []. Slots are de-duplicated by startTime and every slot is returned (booked ones are marked, not removed).",
+      "auth": "Global: helmet/compression/cors/sanitizer + 100 req/min/IP. Router: authCheck (L18) - any authenticated user may probe any physician. Route: NO cacheMiddleware. In-handler gate (only when ?clinicId is supplied AND clinic.allowPatientBooking === false): isOwner = req.user?.id === query.physicianUserId, else prisma.clinicStaff.findFirst({clinicId, userId: req.user.id, isActive:true}); failure returns 200 [] not 403. NO aiUsageCheck, NO auditLog.",
+      "successStatus": 200,
+      "requestQuery": [
+        "physicianUserId: string (REQUIRED - this is the USER id, not the PhysicianProfile id)",
+        "date: string 'YYYY-MM-DD' (REQUIRED - concatenated as `date+'T12:00:00'` for weekday and `date+'T00:00:00'` / `date+'T23:59:59.999'` for the booked-window, all LOCAL time)",
+        "clinicId?: string - when absent, slots from ALL of the physician's clinics are merged"
+      ],
+      "requestBody": [],
+      "responseShape": "// JSON array (possibly empty), each element = a TimeSlot plus clinic name plus isBooked:\n[\n  {\n    \"id\": \"uuid\",\n    \"clinicId\": \"uuid\",\n    \"physicianId\": \"uuid\",              // PhysicianProfile.id, NOT the userId that was queried\n    \"dayOfWeek\": 0,                      // int 0=Sunday .. 6=Saturday\n    \"startTime\": \"09:00\",                // string\n    \"endTime\": \"09:30\",                  // string\n    \"slotDuration\": 30,                  // int minutes\n    \"isActive\": true,                    // always true (where-filtered), still emitted\n    \"createdAt\": \"ISO string\",\n    \"clinic\": { \"name\": \"string\" },      // name ONLY\n    \"isBooked\": false                    // computed, appended last by the spread\n  }\n]\n\n// The requested date is NOT echoed anywhere in the response - the client must remember it.\n// Key order: TimeSlot scalars in schema order, then clinic, then isBooked.",
+      "errorCases": [
+        "400 {\"error\":\"physicianUserId and date are required\"} when either is missing/falsy",
+        "200 [] when no PhysicianProfile exists for physicianUserId (NOT 404)",
+        "200 [] when clinic.allowPatientBooking === false and the caller is neither the physician nor active staff (NOT 403)",
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global limiter",
+        "500 {\"error\":\"Failed to check availability\"} on any thrown error - including a malformed ?date (Invalid Date -> getDay() NaN -> prisma validation error). No 400 for bad date format."
+      ],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "Clinic (findUnique - allowPatientBooking, physicianId; and via include - name)",
+        "ClinicStaff (findFirst - clinicId + userId + isActive)",
+        "TimeSlot (findMany - full rows)"
+      ],
+      "externalDeps": [
+        "lib/logger"
+      ],
+      "sideEffects": [
+        "None (pure read). Not cached.",
+        "Global request log line"
+      ],
+      "quirks": [
+        "THREE DIFFERENT 'not allowed' outcomes all return 200 [] - missing physician profile, booking-disabled clinic with an unauthorized caller. Never 403/404. A port that returns 403 breaks the client, which just renders 'no slots'.",
+        "The booking gate is only evaluated when ?clinicId is supplied. Omit clinicId and the allowPatientBooking=false protection is bypassed entirely - slots from booking-disabled clinics are returned to any authenticated user.",
+        "The gate's owner check compares `req.user.id === physicianUserId` (the query string), NOT the resolved PhysicianProfile - a string compare against untrusted input.",
+        "`clinic.physicianId` is selected in the gate query but never used.",
+        "Weekday is derived from `new Date(date + 'T12:00:00')` - LOCAL NOON, deliberately, to dodge DST/midnight rollover. A port that parses the date as UTC midnight will pick the wrong dayOfWeek for negative-UTC-offset servers.",
+        "The booked-appointments window uses `new Date(date+'T00:00:00')` .. `new Date(date+'T23:59:59.999')` (local), which is a DIFFERENT construction from GET /'s `new Date(date)` + setHours. The two endpoints can disagree on which day a boundary appointment belongs to.",
+        "Booked-detection is by startTime STRING EQUALITY only (`Set` of appointment.startTime). endTime is selected from the DB and never used, so overlapping-but-not-identical bookings do NOT mark a slot booked, and a slot whose startTime string differs only in padding ('9:00' vs '09:00') reads as free.",
+        "The booked query is scoped by physicianId and date ONLY - NOT by clinicId. An appointment the physician has at clinic B at 09:00 marks the 09:00 slot at clinic A as booked.",
+        "Booked statuses are PENDING and CONFIRMED only - COMPLETED, CANCELLED and NO_SHOW appointments free the slot back up.",
+        "De-duplication by startTime keeps the FIRST slot seen in `orderBy: {startTime:'asc'}` order and discards the rest. With no ?clinicId this collapses same-time slots ACROSS DIFFERENT CLINICS, so only one clinic's slot survives and the surviving row's clinicId/clinic.name is effectively arbitrary among ties.",
+        "Booked slots are RETURNED with isBooked:true, not filtered out - the client is responsible for disabling them.",
+        "`isActive: true` is in the where clause yet the field is still emitted on every row (always true).",
+        "Slots are the recurring weekly TEMPLATE - there is no per-date slot storage, no holiday/blackout handling, and past dates return the same list as future dates.",
+        "`orderBy: { startTime: 'asc' }` is a string sort, and the de-dup depends on that order, so the sort must be replicated as an ordinal string sort or the surviving duplicate changes.",
+        "Empty array vs null: always an array, never null.",
+        "Not cached, unlike / and /today."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/ai-optimize",
+      "nodeLines": "L1328-L1557",
+      "summary": "Physician-only scheduling analytics. Stage 1 aggregates 90 days of the physician's appointments (plus completed visit durations and active time slots) into a large computed `stats` object entirely in JS. Stage 2 sends that stats JSON to the AI gateway asking for 3-5 scheduling insights, parses/sanitizes the JSON array it gets back, and returns { stats, insights, aiProvider }. Any AI failure degrades to insights:[] with stats intact.",
+      "auth": "Global: helmet/compression/cors/sanitizer + 100 req/min/IP. Router: authCheck (L18). NO cacheMiddleware. In-handler gate: prisma.physicianProfile.findUnique({where:{userId}}) -> 403 if absent. NO aiUsageCheck (no quota/plan check at all on this AI call), NO auditLog middleware - but aiGateway.chat writes its own AiAuditLog row.",
+      "successStatus": 200,
+      "requestQuery": [],
+      "requestBody": [],
+      "responseShape": "// ---------- Branch A: fewer than 5 appointments in the window (EARLY RETURN, 200) ----------\n{\n  \"stats\": null,\n  \"insights\": [],\n  \"message\": \"Not enough appointment data for analysis. Need at least 5 appointments in the last 90 days.\"\n}\n// NOTE: \"aiProvider\" is ABSENT in this branch, and \"message\" is ABSENT in the normal branch.\n\n// ---------- Branch B: normal (200) ----------\n{\n  \"stats\": {\n    \"totalAppointments\": 42,                 // int\n    \"completed\": 30,                         // int\n    \"noShows\": 5,                            // int  (key is plural, unlike the *Rate keys)\n    \"cancelled\": 4,                          // int  (British spelling, two L's)\n    \"noShowRate\": 0.119,                     // number, 3 decimals, 0..1 FRACTION not percent\n    \"cancelRate\": 0.095,                     // number, 3 decimals  (key is cancelRate, not cancelledRate)\n    \"completionRate\": 0.714,                 // number, 3 decimals\n    \"avgVisitDurationMin\": 18,               // int OR null when no usable completed visits\n    \"avgSlotDuration\": 30,                   // int, defaults to 30 when no active slots\n    \"peakHour\": \"14:00\",                     // STRING built as `${hourKey}:00`, defaults to \"09:00\"\n    \"busiestDay\": \"Monday\",                  // English day name, or the literal \"N/A\"\n    \"avgDailyPatients\": 3.5,                 // number, 1 decimal\n    \"slotUtilization\": 0.404,                // number, 3 decimals, CAPPED at 1\n    \"dayStats\": [                            // array, sorted by total DESC; only days that occur\n      {\n        \"day\": \"Monday\",                     // dayNames[dayIndex], English, Sunday-first\n        \"dayIndex\": 1,                       // int 0..6, 0=Sunday\n        \"total\": 12,                         // int\n        \"noShowRate\": 0.083,                 // number, 3 decimals\n        \"cancelRate\": 0.0                    // number, 3 decimals\n      }\n    ],\n    \"hourDistribution\": [                    // array, sorted by hour string localeCompare ASC\n      { \"hour\": \"09:00\", \"count\": 7 }         // hour = `${startTime.split(':')[0]}:00`\n    ],\n    \"typeBreakdown\": {                        // OBJECT map, only types present; keys unordered-ish\n      \"IN_PERSON\": 30,\n      \"WALK_IN\": 12\n    },\n    \"totalActiveSlotsPerWeek\": 13,           // int = activeSlots.length\n    \"analyzedDays\": 12                       // int = distinct calendar days with appointments\n  },\n  \"insights\": [                               // array, 0..6 items; [] on ANY AI or parse failure\n    {\n      \"type\": \"NO_SHOW\",                      // one of NO_SHOW|SLOT_DURATION|PEAK_HOURS|UTILIZATION|CANCELLATION|THROUGHPUT (else coerced to \"THROUGHPUT\")\n      \"title\": \"string\",                      // truncated to 120 chars\n      \"description\": \"string\",                // truncated to 500 chars\n      \"impact\": \"HIGH\"                        // HIGH|MODERATE|LOW (else coerced to \"MODERATE\")\n    }\n  ],\n  \"aiProvider\": \"openai\"                      // \"openai\" | \"gemini\" | \"micromind\" | null\n}\n\n// stats key order is exactly as listed above (object-literal order at L1487-L1505).",
+      "errorCases": [
+        "403 {\"error\":\"Only physicians can access scheduling insights\"} when no PhysicianProfile exists for req.user.id",
+        "200 {\"stats\":null,\"insights\":[],\"message\":\"Not enough appointment data for analysis. Need at least 5 appointments in the last 90 days.\"} when fewer than 5 appointments matched",
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global limiter",
+        "500 {\"error\":\"Failed to generate scheduling insights\"} only if Stage 1 (the DB/aggregation part) throws - AI failures are swallowed and never produce a 5xx"
+      ],
+      "dbWrites": [
+        "AiAuditLog - one row per call, written inside aiGateway.logAudit (NOT in a transaction, errors swallowed). Fields: agent='scheduler', provider, model, userId, inputHash(sha256 of system+user), tokensUsed, costUsd, latencyMs, success, errorMsg, cached, metadata. Written on cache hit (tokensUsed 0, cached true), on success, and on total provider failure (provider='none', model=null, success=false)."
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "TimeSlot (findMany - dayOfWeek, startTime, endTime, slotDuration)",
+        "Visit (findMany - visitDate, completedAt; status COMPLETED, completedAt not null, visitDate gte 90d)",
+        "AiAuditLog (created by aiGateway)"
+      ],
+      "externalDeps": [
+        "services/aiGateway - lazily `require`d INSIDE the try block; ai.chat({system,user,temperature:0.2,maxTokens:1200,useCache:true,metadata:{agent:'scheduler',userId}})",
+        "OpenAI / Gemini / MicroMind HTTP APIs via the aiGateway provider chain",
+        "aiGateway's own in-process response cache (keyed by sha256 of system+user)",
+        "lib/logger"
+      ],
+      "sideEffects": [
+        "One outbound LLM call (unless the aiGateway prompt cache hits)",
+        "One AiAuditLog DB row",
+        "Token spend / cost - with NO quota or plan enforcement on this route",
+        "Global request log line"
+      ],
+      "quirks": [
+        "TWO DIFFERENT RESPONSE SHAPES: the <5-appointments branch has `message` and NO `aiProvider`; the normal branch has `aiProvider` and NO `message`. A port must omit the keys, not send them as null.",
+        "All rates are FRACTIONS 0..1 rounded to 3 decimals via `parseFloat(x.toFixed(3))`, not percentages. parseFloat drops trailing zeros, so 0.100 serializes as 0.1 and an exact 0 serializes as 0 (integer). .NET decimal/double formatting must match: round-half-away-from-zero at 3 dp then emit the shortest form.",
+        "`avgDailyPatients` uses toFixed(1) then parseFloat, so 3.0 serializes as 3 (no decimal point).",
+        "`slotUtilization` is computed with toFixed(3) and THEN wrapped in Math.min(x, 1) inside the stats literal - the cap is applied after rounding.",
+        "The 90-day window is `now - 90 days` KEEPING THE CURRENT TIME OF DAY (`setDate(getDate()-90)`), not a midnight boundary - so results shift within the day.",
+        "The window has NO UPPER BOUND (`appointmentDate: { gte: ninetyDaysAgo }`), so FUTURE appointments are included in every metric. 'Last 90 days' in the prompt text and message is a lie; noShowRate is diluted by unheld future bookings.",
+        "The <5 threshold counts ALL statuses including CANCELLED and future ones.",
+        "Soft-deleted appointments (deletedAt != null) and soft-deleted visits are NOT excluded.",
+        "`totalCapacity = activeSlots.length * Math.ceil(90/7)` = slots x 13. This treats the CURRENT slot template as if it had been in effect for all 13 weeks, and counts a weekly template row once per week - it is a rough proxy, not a real capacity figure. Copy the arithmetic literally, including the hard-coded ceil(90/7)=13.",
+        "`avgVisitDurationMin` is derived as (completedAt - visitDate)/60000 with outliers filtered to `> 0 && < 300` minutes; null when the list ends up empty. Math.round, so integer minutes.",
+        "`peakHour` is the raw hour KEY from startTime.split(':')[0] with ':00' appended - so a badly padded startTime '9:00' yields peakHour \"9:00\", not \"09:00\". Default when byHour is empty is '09' -> \"09:00\" (unreachable in practice given the >=5 guard).",
+        "`hourDistribution` is sorted with `a.hour.localeCompare(b.hour)` on the string - locale-sensitive string ordering, and mixed padding ('9:00' vs '09:00') sorts wrongly. Port with an ordinal string comparison to stay identical for padded data.",
+        "`dayStats` derives from `Object.entries(byDay)` where the keys are numeric strings - V8 enumerates integer-like keys ASCENDING, then Array.sort (stable) reorders by total DESC. Ties therefore keep ascending dayIndex order. A .NET Dictionary has no such guarantee: build the intermediate ordered by dayIndex ascending, then stable-sort by total descending.",
+        "`busiestDay` = dayStats[0]?.day || 'N/A' - the literal string \"N/A\" is a possible value.",
+        "Day names are hard-coded English, Sunday-first, and `dayIndex` is JS getDay() (0=Sunday). No localization even though the client is bilingual.",
+        "`analyzedDays` counts distinct `new Date(appointmentDate).toDateString()` values - SERVER-LOCAL day bucketing via a JS-specific format string.",
+        "`typeBreakdown` is a bare object map, not an array, and only contains types that actually occur (never zero-filled). Null appointmentType is bucketed as 'IN_PERSON'.",
+        "Key-name traps: `noShows` (plural) vs `noShowRate`; `cancelled` (two L's) vs `cancelRate` (one L, no -led); `avgVisitDurationMin` (Min suffix) vs `avgSlotDuration` (no suffix); `totalActiveSlotsPerWeek`; `analyzedDays`.",
+        "`aiProvider = result.provider` is assigned BEFORE the JSON parse, so a successful LLM call whose output fails to parse returns aiProvider set (e.g. \"openai\") together with insights:[]. Only a thrown ai.chat gives aiProvider:null.",
+        "AI text is de-fenced with `.replace(/```json\\n?/g,'').replace(/```\\n?/g,'').trim()` before JSON.parse; a non-array parse result is coerced to []; items missing type/title/description are dropped.",
+        "The sanitizer caps title at 120 and description at 500 chars and slices to 6 items, even though the system prompt asks for max 80 chars and 3-5 insights. The CODE limits are the contract.",
+        "insights ordering is whatever the LLM returned (post-filter) - the 'ordered by impact' instruction is not enforced in code.",
+        "insights is inherently NON-DETERMINISTIC across calls, but aiGateway's useCache:true means the same stats JSON returns the same cached text (and still writes an AiAuditLog row with tokensUsed 0, cached true).",
+        "The `id`, `endTime`, `clinicId`, `cancelledAt` and `cancelReason` fields are selected from appointments but never used in any metric - only status, appointmentDate, startTime and appointmentType are.",
+        "activeSlots is queried with no clinic scoping, so a physician with several clinics has their capacity/duration averages pooled across all of them.",
+        "No cacheMiddleware on this route, so every page load costs a DB aggregation and potentially an LLM call.",
+        "Declared after `router.delete('/:id')` but that is a DELETE handler, so no GET shadowing occurs in Node. Preserve literal-route-before-parameterized-route registration in .NET."
+      ]
+    }
+  ]
+}

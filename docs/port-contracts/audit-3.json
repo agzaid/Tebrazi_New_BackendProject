@@ -1,0 +1,134 @@
+{
+  "missedRoutes": [],
+  "contractErrors": [
+    {
+      "endpoint": "POST /:id/generate-soap",
+      "claim": "\"aiUsage\": { \"used\": 12, \"limit\": 50, \"remaining\": 38, \"tier\": \"FREE\" } | null — i.e. numbers or null.",
+      "truth": "aiUsage is req.aiUsage (visits.js:905), set by aiUsageLimiter.js:177-185. For the CLINIC tier monthlyAiCalls is Infinity, so the else-branch (aiUsageLimiter.js:184) sets { used: 0, limit: Infinity, remaining: Infinity, tier }. JSON.stringify(Infinity) === \"null\", so a CLINIC physician actually receives {\"used\":0,\"limit\":null,\"remaining\":null,\"tier\":\"CLINIC\"} — an object with NULL numeric members, not the whole object being null. System.Text.Json throws on double.PositiveInfinity by default and emits \"Infinity\" with AllowNamedFloatingPointLiterals, so a literal port breaks byte-identity here.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "DELETE /:id",
+      "claim": "Quirks cover the lying JSDoc and the un-set deletedAt; response is { message: \"Visit archived successfully\" }.",
+      "truth": "Missed the inverted guard order. visits.js:1347-1348 looks up the PhysicianProfile FIRST and returns 403 {\"error\":\"Physician access required\"} before visits.js:1350-1351 does the 404. Every other handler in the file (PUT /:id L397, PUT /:id/complete L494, generate-soap L681, transcribe L974, suggest-codes L1029, investigations L1140/L1177/L1219, patient-note L1387, patient-dismiss L1427) is 404-then-403. So a PATIENT calling DELETE on a visit id that does not exist gets 403 here and 404 everywhere else. There is also no status guard: DELETE on an already-ARCHIVED or still-IN_PROGRESS visit returns the same 200.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "PUT /:id/patient-feedback",
+      "claim": "Response list is 200 + 400 (empty feedback) + 404 (missing visit) + 403 (wrong owner), and \"the 400 for empty feedback precedes the 404 ... and the 403\".",
+      "truth": "A FOURTH gate is missing: visits.js:630-632 returns 400 {\"error\":\"Can only add feedback to completed visits\"} when visit.status !== 'COMPLETED'. Full observable order is 400-empty (L621) → 404 (L625) → 403 (L629) → 400-not-completed (L631) → 200. A port that omits this gate lets patients write feedback on IN_PROGRESS visits, which Node rejects.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "PUT /:id",
+      "claim": "\"!== undefined semantics: JSON has no undefined, so the effective rule is 'key PRESENT in the JSON body'\" — implying every listed field round-trips uniformly.",
+      "truth": "specialtyData is MISSING from the isFollowUpOnly guard at visits.js:413-417 (that list covers rawNotes, rawTranscript, chiefComplaint, diagnosis, diagnosisCodes, subjective, objective, assessment, plan — not specialtyData). So on a COMPLETED visit, PUT with {\"followUpNotes\":\"x\",\"specialtyData\":{...}} passes the guard, but followUpData (L420-422) only ever carries followUpDate/followUpNotes, so specialtyData is SILENTLY DISCARDED and the handler returns 200 with the old specialtyData. On a non-COMPLETED visit the same key IS applied (L462). Two different behaviours for the same key depending on status.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "PUT /:id/investigations/:invId",
+      "claim": "Quirks list only the asymmetric falsy checks and completedAt; no 404 for a missing investigation is mentioned (the 404 gap is attributed to the sibling DELETE).",
+      "truth": "This handler DOES 404: visits.js:1188-1192 does findFirst({id: invId, visitId: id}) and returns 404 {\"error\":\"Investigation not found for this visit\"} — a distinct message from the visit-level {\"error\":\"Visit not found\"} at L1177. So PUT and DELETE differ: PUT 404s on a bad/cross-visit invId, DELETE returns 200 {\"success\":true}. Also, `status` IS a Prisma enum (InvestigationStatus: REQUESTED|IN_PROGRESS|COMPLETED|CANCELLED, schema.prisma), so an unrecognised non-empty status string reaches prisma.investigation.update and yields 500 {\"error\":\"Failed to update investigation\"} — not a 400. And completedAt is never cleared when status moves away from COMPLETED, while re-sending COMPLETED refreshes it (L1185).",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "POST /:id/investigations",
+      "claim": "\"subprofileId\": \"<uuid> | null\" — presented as the body value.",
+      "truth": "visits.js:1150 is `subprofileId: subprofileId || visit.subprofileId || null`. When the body omits subprofileId, the new investigation INHERITS the parent visit's subprofileId. A port that writes only the body value returns null where Node returns the visit's subprofile id, and every subsequent read of that investigation is mis-scoped. There is also no validation that subprofileId belongs to this patient — an unknown id is an FK violation and surfaces as 500 {\"error\":\"Failed to create investigation\"}.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /",
+      "claim": "Shape given is the PHYSICIAN branch with a `patientUser` object.",
+      "truth": "`patientUser` has TWO different sub-shapes plus null, decided per row at visits.js:156-161. clinicPatient rows: {\"displayName\": cp.name, \"phone\": cp.phone} — exactly 2 keys, NO id, NO email. App-user rows: {\"id\",\"displayName\",\"email\"} (select at L147-148) — 3 keys, NO phone. Unresolvable patientUserId: null. This is a third distinct sub-shape from GET /:id, which returns {\"displayName\",\"email\",\"phone\"} for clinicPatient rows (L334) and {\"displayName\",\"email\",\"phone\"} for user rows (L337) — neither carries `id`. One shared .NET DTO for patientUser cannot reproduce all four.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /",
+      "claim": "Only the PHYSICIAN branch shape is given.",
+      "truth": "The non-physician branch (visits.js:139-145) rest-destructures OUT subjective, objective, assessment, plan, rawNotes, rawTranscript, audioUrl — those 7 keys are ABSENT from the JSON, not null. It also does NOT attach `patientUser` at all (that enrichment is physician-only, L146-161). sharedSections is NOT honoured in the list — it is returned raw and the SOAP keys are unconditionally gone, whereas GET /:id keeps the SOAP keys and nulls the unshared ones (L347-352). A single VisitDto emitting nulls in the list body changes the bytes. The patient list rows keep clinic/physician/subprofile/clinicPatient/_count and 23 scalars, in schema order minus the 7 stripped keys.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "POST /",
+      "claim": "Shape shown lists Visit scalars (id … followUpNotes …).",
+      "truth": "The create at visits.js:231-236 has an `include`, so the 201 body carries three relation keys after the 30 scalars, with sub-shapes unique to this endpoint: \"clinic\": {\"name\": \"...\"} — name ONLY, no id/specialty/phone; \"subprofile\": {\"name\",\"relation\"} | null — NO id (GET / and GET /:id both include id); \"clinicPatient\": {\"id\",\"name\",\"phone\"} | null. 33 keys total. Reusing the GET / or GET /:id relation projections here adds keys the client never sees today.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /follow-ups-due",
+      "claim": "Quirks cover only the /:id shadowing and the notification burst.",
+      "truth": "The route is wrapped in cacheMiddleware(30) (visits.js:1244). cacheMiddleware.js:24-30 keys on `route:${req.user.id}:${req.originalUrl}` and, on a hit, returns the stored body via res.json without ever entering the handler — so within 30s the body is byte-frozen AND the FOLLOW_UP_REMINDER loop (L1300-1322) is skipped entirely. The `res.json([])` early return for a physician with no profile (L1248) is cached too. A port without this cache both changes freshness and multiplies reminder writes.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "GET /follow-ups-due",
+      "claim": "\"orderBy followUpDate asc, take 20\" for follow-ups \"today, overdue, or in next 7 days\".",
+      "truth": "The where clause (visits.js:1257-1261) is only {physicianId, status:'COMPLETED', followUpDate:{lte: weekAhead}} — there is NO lower bound and NO softDeleteFilter. Two consequences the extraction misses: (a) soft-deleted visits (deletedAt != null) DO appear here, unlike GET / which applies softDeleteFilter at L86; (b) combined with orderBy asc + take 20, the twenty OLDEST overdue rows (arbitrarily far in the past) fill the payload and today's/upcoming follow-ups can be entirely absent. Also weekAhead is local-midnight+7d, so `lte` excludes anything later than 00:00:00 on day 7, and `today` (L1250) is SERVER-local midnight, making isOverdue/isToday/urgency timezone-dependent.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /:id/generate-soap",
+      "claim": "\"message\": \"SOAP note generated by AI. Review and edit as needed.\" and \"enhanced\": false as fixed values.",
+      "truth": "Both are conditional on the request body's `enhance`. visits.js:895-897: when enhance is truthy the message is the different literal \"SOAP note generated with GPT-4o (enhanced). Review and edit as needed.\", and L904 emits \"enhanced\": true. enhance also flips maxTokens 2000→3000 (L790) and metadata.agent 'soap'→'soap_enhanced' (L791), which routes the gateway to openai/gpt-4o via AGENT_MODEL_DEFAULTS (aiGateway.js:431) — so aiProvider/aiModel change with it, while the rate limiter is still keyed 'soap' (the same limiter-key/agent-name split the extraction flagged for icd10/icd_coder, unflagged here).",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /:id/generate-soap",
+      "claim": "\"specialtyData\": { \"iop_od\": \"14\", ... , \"__templateKey\": ... } — presented as the visit's specialty data.",
+      "truth": "visits.js:907 is `specialtyData: mergedSpecialtyData || null`. mergedSpecialtyData is non-null ONLY when the second AI call parsed JSON and added at least one non-empty field (L855-866). So the response's specialtyData is null on every normal run — including runs where the visit already HAS stored specialtyData — while specialtyKey (L908) is still populated. A port that echoes updated.specialtyData instead would send an object where Node sends null.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "PUT /:id/complete",
+      "claim": "Quirks are the two dead appointmentId blocks; shape is the visit plus `message` last.",
+      "truth": "Two live behaviours are missing. (1) sharedSections semantics are inverted from intuition: visits.js:505-508 filters the array against ['subjective','objective','assessment','plan'] and, if the survivors are EMPTY, sets sectionsToStore back to null — and null means share ALL (see GET /:id L343-353). So {\"sharedSections\":[]} and {\"sharedSections\":[\"bogus\"]} both share the entire SOAP note; any non-array value (string, object, number) also lands on null via the Array.isArray gate at L505. (2) There is NO status guard: re-completing an already-COMPLETED visit succeeds, overwrites completedAt with a fresh now() (L513), and re-fires the VISIT_COMPLETED patient email (L529-539, sendEmail: true) plus one staff notification per active clinicStaff row (L543-563) on every call.",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "PATCH /:id/patient-note",
+      "claim": "Quirks are the silent clear, the no-trim, and the differing validation vs PUT /:id/patient-feedback.",
+      "truth": "The status asymmetry is missing and it is the bigger one: this handler has NO status gate at all (visits.js:1386-1391 is 404 then 403 then straight to update), so a patient can write into patientFeedback on an IN_PROGRESS or CANCELLED visit — a visit their own GET / cannot even list (L108: status in ['COMPLETED','ARCHIVED']) — while the sibling PUT /:id/patient-feedback rejects the identical write with 400 at L631. Same column, three different validation regimes (trim, emptiness, status).",
+      "severity": "breaks-client"
+    },
+    {
+      "endpoint": "POST /:id/suggest-codes",
+      "claim": "Elements shown as {code: \"E11.9\", description: \"...\", confidence: 0.92}, i.e. model output passed through with only key-pruning.",
+      "truth": "visits.js:1097-1108 rewrites every value: code = String(c.code).toUpperCase().substring(0,10) (UPPERCASED and hard-truncated at 10 chars), description = String(c.description).substring(0,200) (truncated at 200), confidence = typeof c.confidence === 'number' ? clamp(0,1) : 0.5 (a string \"0.9\" from the model becomes exactly 0.5, and out-of-range numbers are clamped). Elements missing code OR description are dropped first (L1096), codes already present in visit.diagnosisCodes are filtered OUT (L1105-1106, so the same request returns fewer codes after the physician assigns them), and the cap is .slice(0,8) (L1107) despite the prompt asking for 2-6. The chat call also passes useCache: true (L1090), so identical inputs replay a cached provider/model.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /",
+      "claim": "The 500 body leaks raw error.message and 'detail' is singular — treated as the only notable failure path.",
+      "truth": "The reachable trigger is missing: visits.js:101 assigns `where.status = status` straight from req.query with no VisitStatus validation, so GET /api/visits?status=foo makes Prisma reject the enum and produces 500 {\"error\":\"Failed to list visits\",\"detail\":\"<raw Prisma message>\"}. The same line also means ?status=ARCHIVED lets a physician list archived visits, contradicting the L99 comment and the DELETE /:id archive quirk. Separately, the branch selector at L84 reads req.user.userType, which comes from the JWT payload (auth.js:14), not the database — a userType changed in the DB does not change the branch until the token is reissued.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /:id",
+      "claim": "One physician-owner shape plus a patient variant; ISO strings for every DateTime.",
+      "truth": "Two further shape facts. (1) The include-failure fallback (visits.js:296-313) omits subprofile/investigations from the query and then ASSIGNS visit.investigations = [] and visit.subprofile = null after the fact, so the JSON key order becomes clinic, physician, prescriptions, investigations, subprofile — versus clinic, physician, subprofile, prescriptions, investigations on the primary path — and _count is absent on both (unlike GET /). (2) In the patient branch sharedSections is REPLACED by the normalised local (L342, L361): a stored value that is not an array comes back as null, whereas the physician branch (L367) returns the raw stored Json verbatim.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "POST /:id/transcribe",
+      "claim": "5 keys; language is `transcription.language || <requested language>`.",
+      "truth": "Correct, but the requested value is itself defaulted: visits.js:983 sends `req.body.language || 'en'`, so the fallback is the literal \"en\", never undefined/omitted (aiGateway.js:186). Two further gaps: the response carries NO aiUsage key even though aiUsageCheck('scribe') ran and populated req.aiUsage (unlike generate-soap); and the 500 handler is `error: error.message || 'Failed to transcribe audio'` (L1008), so a missing key yields 500 {\"error\":\"Transcription requires OPENAI_API_KEY (Whisper API)\"} (aiGateway.js:531) — a leaked internal string distinct from the generic fallback. Note also the global body sanitizer (index.js:77-80) runs BEFORE multer, so at sanitize time req.body is empty and the multipart `language` field is never sanitized — unlike every JSON body in this file.",
+      "severity": "wrong-but-tolerable"
+    },
+    {
+      "endpoint": "GET /specialty-template",
+      "claim": "allTemplates order is ophthalmology, cardiology, neurology, orthopedics, pediatrics, … (11 templates).",
+      "truth": "Count is right; the position that is easy to get wrong is internal_medicine, which sits SEVENTH — specialtyTemplates.js declares them at L13/65/99/134/161/194/228/260/294/327/362 as ophthalmology, cardiology, neurology, orthopedics, pediatrics, pulmonology, internal_medicine, dermatology, obgyn, psychiatry, ent. Its label is \"Systems Review\" (not \"Internal Medicine Exam\") and its icon is 🩺. Also `specialty` (L47) is a non-nullable String on PhysicianProfile, so on the 3-key branch it is always a string, never null; and `template` is null there whenever physician.specialty is not one of the 47 alias strings in SPECIALTY_ALIASES (L397-455).",
+      "severity": "cosmetic"
+    }
+  ],
+  "routeOrderHazards": [
+    "specialty-template — GET /api/visits/specialty-template is a single segment and collides with GET /{id}. In Node it wins only because it is registered at L32, before /:id at L272. In ASP.NET a literal segment beats a parameter regardless of registration order, so this one is safe by construction — but do not add a route constraint (e.g. {id:guid}) as the \"fix\", because Visit.id is unconstrained TEXT and a guid constraint would turn today's 404 {\"error\":\"Visit not found\"} into a routing 404 with a different body.",
+    "follow-ups-due — INVERTED HAZARD. GET /api/visits/follow-ups-due is a single segment that Node currently binds to GET /:id (L272, registered 972 lines before the real handler at L1244), returning 404 {\"error\":\"Visit not found\"}. In ASP.NET the literal automatically wins, so simply mapping it un-shadows the endpoint and silently ships a live feature plus a backlog of FOLLOW_UP_REMINDER writes. To stay byte-faithful, either do not map the literal at all, or map it to the /{id} not-found body.",
+    "inbox — same inverted hazard. The client calls GET /api/visits/inbox (client-endpoints.txt:171) and Node answers 404 {\"error\":\"Visit not found\"} via GET /:id. Do NOT map an `inbox` literal; leaving it to bind as {id} is what reproduces the current bytes.",
+    "complete, patient-feedback, generate-soap, transcribe, suggest-codes, investigations, patient-note, patient-dismiss — the second-segment literals under /{id}/. No parameterised sibling exists at that position today (there is no /{id}/{x} route), so they are unambiguous; but if a catch-all /{id}/{sub} is ever added they must precede it.",
+    "investigations — the middle literal in /{id}/investigations/{invId}. Keep the parameter name invId, not investigationId: the third segment is a distinct id and the handler validates it against the visit (L1188-1192).",
+    "patient — GET /api/visits/patient/{patientUserId} (client-endpoints.txt:172) matches NO route in Node and falls through to the global 404 at index.js:302-308 with body {\"error\":\"Not Found\",\"message\":\"Route GET /api/visits/patient/<id> not found\"}. Two segments, so it cannot be swallowed by /{id}. Do not add it as a real route; and note ASP.NET resolves routing before auth, so it will 404 where Node 401s (router.use(authCheck) at L21 is path-agnostic and runs on the mount prefix)."
+  ],
+  "verdict": "Route inventory is COMPLETE — the file contains exactly 18 router.<verb> registrations (L32, 61, 82, 182, 272, 391, 488, 611, 674, 964, 1023, 1129, 1168, 1211, 1244, 1342, 1379, 1419) plus router.use(authCheck) at L21, and the extraction covers all 18. The two extra entries in its list of 20 (GET /patient/:patientUserId, GET /inbox) are correctly identified as nonexistent, and I confirmed there is no second router mounted at /api/visits (index.js:216 is the only mount) and no /inbox or /patient/:x handler anywhere under server/src/routes.\n\nThe extraction's headline quirks hold up: the GET /:id shadowing of /follow-ups-due, the detail/details singular-plural split, the two dead visit.appointmentId blocks in PUT /:id/complete (Visit has no appointmentId column — confirmed against schema.prisma), the `objective` field gating suggest-codes but never appearing in its prompt, the omitted subprofileName key, DELETE-investigation's silent {success:true}, and the 401-before-404 consequence of a path-agnostic router.use(authCheck) are all accurate and well caught.\n\nWhere it is wrong or thin, the theme is response-shape VARIANTS the single quoted example hides. The one that will actually break a typed port is aiUsage on a CLINIC-tier physician: aiUsageLimiter.js:184 stores Infinity, and JSON.stringify turns that into {\"limit\":null,\"remaining\":null} — not the whole-object null the extraction documents, and not something System.Text.Json produces by default. Close behind: the three mutually incompatible `patientUser` sub-shapes (2-key / 3-key / null across GET / and GET /:id), the POST / 201 relation projections that are narrower than every other endpoint's (clinic name only, subprofile with no id), the non-physician GET / branch where the SOAP keys are ABSENT rather than nulled and patientUser is not attached at all, and the four missing status/ordering gates (DELETE /:id's 403-before-404, patient-feedback's fourth 400, patient-note's absent status gate, PUT /:id/investigations' real 404). Two further behaviours are absent entirely: cacheMiddleware(30) on /follow-ups-due, which freezes the body for 30s and skips the reminder loop on a hit, and generate-soap's `enhance` branch, which changes the message literal, the enhanced flag, the token budget, and the provider/model routing.\n\nNet: treat the extraction's shapes as the happy-path sample, not the contract. Every endpoint that returns a Visit or a relation needs its own DTO — there is no single shared VisitDto that reproduces GET /, GET /:id (primary and fallback), POST /, PUT /:id, and PUT /:id/complete simultaneously."
+}

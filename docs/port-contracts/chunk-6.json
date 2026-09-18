@@ -1,0 +1,510 @@
+{
+  "endpoints": [
+    {
+      "method": "PUT",
+      "path": "/:id/confirm",
+      "nodeLines": "L741-L783",
+      "summary": "Physician (owner of the appointment's physicianProfile) or any active staff member of the appointment's clinic flips status to CONFIRMED and stamps confirmedAt = now. Notifies the patient (in-app + email). Returns the updated Appointment row plus a `message` key.",
+      "auth": "Global: helmet, compression, ETag 'strong', cors (allowedHeaders Content-Type/Authorization/X-Clinic-Id), express.json({limit:'10mb'}), express.urlencoded, global XSS body sanitizer (mutates every string in req.body), rateLimit 100 req/min/IP on /api, request logger, metrics middleware. Router: router.use(authCheck) at L18 — Bearer JWT via jsonwebtoken.verify, payload {id,email,role,userType,displayName}. NO aiUsageCheck, NO auditLog, NO cacheMiddleware on this route. In-handler gate: isPhysician = physicianProfile.findUnique({userId}) exists AND appt.physicianId === physician.id; else clinicStaff.findFirst({userId, clinicId: appt.clinicId, isActive:true}); if neither -> 403. No userType check — a PATIENT-typed user who is active clinic staff CAN confirm. The booking patient CANNOT confirm (403).",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"clinicId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"patientUserId\": \"uuid\",\n  \"subprofileId\": \"uuid | null\",\n  \"clinicPatientId\": \"uuid | null\",\n  \"status\": \"CONFIRMED\",\n  \"appointmentDate\": \"2026-03-10T00:00:00.000Z\",\n  \"startTime\": \"09:00\",\n  \"endTime\": \"09:30\",\n  \"reason\": \"string | null\",\n  \"notes\": \"string | null\",\n  \"appointmentType\": \"IN_PERSON | VIDEO | PHONE | WALK_IN\",\n  \"confirmedAt\": \"2026-09-03T11:22:33.456Z\",\n  \"completedAt\": \"ISO | null\",\n  \"cancelledAt\": \"ISO | null\",\n  \"cancelReason\": \"string | null\",\n  \"recurringRule\": \"string | null\",\n  \"recurringGroupId\": \"string | null\",\n  \"createdAt\": \"ISO\",\n  \"updatedAt\": \"ISO\",\n  \"deletedAt\": \"ISO | null\",\n  \"message\": \"Appointment confirmed\"\n}\n\n// Exactly the 22 Appointment scalars in prisma schema declaration order, then `message` last (object spread `{...updated, message}`). NO relations — the update() call has no include, so clinic / physician / subprofile are ABSENT (not null).\n// All DateTime values are ISO-8601 UTC with 3-digit milliseconds and trailing Z (Date.prototype.toJSON).",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing or not starting with 'Bearer '",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws (bad signature, expired)",
+        "404 {\"error\":\"Appointment not found\"} when appointment.findUnique({where:{id}}) returns null",
+        "403 {\"error\":\"Not authorized\"} when caller is neither the owning physician nor active clinic staff",
+        "429 {\"error\":\"Too many requests, please try again later\"} from the global /api limiter",
+        "500 {\"error\":\"Failed to confirm\"} on any thrown error inside the try (logged as '[Appointments] Confirm error')"
+      ],
+      "requestBody": [
+        "(none read — req.body is ignored entirely)"
+      ],
+      "requestQuery": [
+        "(none)"
+      ],
+      "dbWrites": [
+        "appointments UPDATE {status:'CONFIRMED', confirmedAt: new Date()} — NOT in a transaction",
+        "notifications INSERT via createNotification — separate, non-transactional, wrapped in its own try/catch"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "ClinicStaff (findFirst by userId+clinicId+isActive) — only evaluated when not the physician",
+        "User (inside notificationService, for email address when sendEmail=true)",
+        "Notification (created)"
+      ],
+      "externalDeps": [
+        "../services/notificationService (lazily require()'d INSIDE the try block, per-request)",
+        "../services/emailService (via createNotification, sendEmail: true)",
+        "../services/pushService (createNotification always best-effort push)",
+        "prisma, logger"
+      ],
+      "sideEffects": [
+        "Notification row for appt.patientUserId: type 'APPOINTMENT_CONFIRMED', title 'Appointment Confirmed', message `Your appointment on ${new Date(appt.appointmentDate).toLocaleDateString()} at ${appt.startTime} has been confirmed.`, data {appointmentId: id}",
+        "Email dispatched (sendEmail: true) to that user's email with subject = title and body `<h2>{title}</h2><p>{message}</p>`",
+        "Push notification attempted unconditionally by createNotification",
+        "NO cache invalidation — GET /api/appointments and GET /api/appointments/today are cacheMiddleware(15) per-user in-memory, so the client can read a stale PENDING status for up to 15s after a successful confirm"
+      ],
+      "quirks": [
+        "Response key order is load-bearing: `message` is appended AFTER all 22 model scalars via spread. Any .NET DTO must emit the same order for byte-identity.",
+        "`message` is a top-level sibling of the model fields, not a wrapper — the client receives a hybrid entity+message object.",
+        "Idempotency/state machine: there is NO guard on current status. Confirming an already CANCELLED, COMPLETED or NO_SHOW appointment silently succeeds and resets status to CONFIRMED. confirmedAt is OVERWRITTEN with now() on every call (unlike check-in, which preserves it).",
+        "`deletedAt` exists on the model as a soft-delete column but NO handler in this file filters on it — a soft-deleted appointment is still findUnique-able and confirmable, and deletedAt is echoed back in the response.",
+        "The notification message uses `toLocaleDateString()` with NO locale argument — server-locale/ICU dependent (e.g. '3/10/2026' on en-US). PUT /:id/cancel uses an explicit 'en-US' with {weekday,month,day} instead. The two endpoints format the same date differently; a faithful port must copy both formats separately.",
+        "Notification failure is swallowed (logger.error) — the 200 is returned even if the notification/email never happens.",
+        "`appt` (the pre-update read) is used for the notification's date/time, `updated` for the response — they can differ if a concurrent write landed in between.",
+        "The staff lookup is short-circuited (`!isPhysician ? findFirst : null`), so a physician who is ALSO staff at another clinic never triggers the staff query. Ordering matters for query-count parity but not for the JSON.",
+        "Physician authorization is by PhysicianProfile.id equality, not by clinic — a physician can confirm an appointment at a clinic they no longer own as long as appt.physicianId matches their profile id.",
+        "No 409 / no optimistic concurrency. Two simultaneous confirms both return 200.",
+        "ETag is 'strong' app-wide; the .NET port must produce a matching validator or the client's conditional requests behave differently (this is a PUT so mostly relevant to the GETs, but the header set must match).",
+        "Prisma emits `status` and `appointmentType` as bare enum STRINGS ('CONFIRMED', 'IN_PERSON') — not ints, not objects."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/cancel",
+      "nodeLines": "L789-L853",
+      "summary": "Physician owner, the booking patient, OR active clinic staff cancels: status=CANCELLED, cancelledAt=now, cancelReason = body.reason || null. Then notifies the OTHER party — patient-initiated notifies the physician (no email), physician/staff-initiated notifies the patient (with email). Returns the updated Appointment plus `message`.",
+      "auth": "Same global chain + router.use(authCheck). In-handler: isPhysician (physicianProfile.userId match AND appt.physicianId === physician.id) OR isPatient (appt.patientUserId === req.user.id) OR active ClinicStaff at appt.clinicId. The staff query runs ONLY if neither physician nor patient. Otherwise 403. No userType gate.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"clinicId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"patientUserId\": \"uuid\",\n  \"subprofileId\": \"uuid | null\",\n  \"clinicPatientId\": \"uuid | null\",\n  \"status\": \"CANCELLED\",\n  \"appointmentDate\": \"2026-03-10T00:00:00.000Z\",\n  \"startTime\": \"09:00\",\n  \"endTime\": \"09:30\",\n  \"reason\": \"string | null\",\n  \"notes\": \"string | null\",\n  \"appointmentType\": \"IN_PERSON | VIDEO | PHONE | WALK_IN\",\n  \"confirmedAt\": \"ISO | null\",\n  \"completedAt\": \"ISO | null\",\n  \"cancelledAt\": \"2026-09-03T11:22:33.456Z\",\n  \"cancelReason\": \"string | null\",\n  \"recurringRule\": \"string | null\",\n  \"recurringGroupId\": \"string | null\",\n  \"createdAt\": \"ISO\",\n  \"updatedAt\": \"ISO\",\n  \"deletedAt\": \"ISO | null\",\n  \"message\": \"Appointment cancelled\"\n}\n\n// 22 Appointment scalars in schema order, then `message`. No relations included.\n// NOTE: `cancelReason` (the new value) is a DIFFERENT field from `reason` (the original booking reason) — both appear and both can be non-null.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/malformed Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "404 {\"error\":\"Appointment not found\"} — id not found",
+        "403 {\"error\":\"Not authorized\"} — not physician, not the booking patient, not active clinic staff",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global limiter",
+        "500 {\"error\":\"Failed to cancel\"} — any throw in the main try ('[Appointments] Cancel error')"
+      ],
+      "requestBody": [
+        "reason: string | optional | nullable — the ONLY field read. Falsy (undefined, '', null, 0) becomes null in cancelReason. Note the global XSS sanitizer has already rewritten this string (strips <script>/<iframe>/... tags, on*= handlers, javascript:/data:/vbscript: prefixes, expression(, and rewrites 'url(' -> 'url\\(') BEFORE the handler sees it — the port must replicate that mangling to store identical text.",
+        "req.body may be entirely absent (client sometimes PUTs with no body) -> reason undefined -> cancelReason null"
+      ],
+      "requestQuery": [
+        "(none)"
+      ],
+      "dbWrites": [
+        "appointments UPDATE {status:'CANCELLED', cancelledAt: new Date(), cancelReason: reason || null} — NOT in a transaction",
+        "notifications INSERT (one row, to exactly one recipient) — separate try/catch, non-transactional"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId; and findUnique by id in the patient-cancelled branch to resolve the physician's userId)",
+        "ClinicStaff (findFirst, only when neither physician nor patient)",
+        "User (findUnique by acting userId, select displayName — used to name the canceller)",
+        "User (inside notificationService for the email address)",
+        "Notification (created)"
+      ],
+      "externalDeps": [
+        "../services/notificationService (require()'d inside the try)",
+        "../services/emailService (only on the physician/staff-cancelled branch, sendEmail:true)",
+        "../services/pushService (always attempted by createNotification)",
+        "prisma, logger"
+      ],
+      "sideEffects": [
+        "Branch A — isPatient true: reads physicianProfile.findUnique({id: appt.physicianId}).userId; if found, Notification to the physician: type 'APPOINTMENT_CANCELLED', title 'Appointment Cancelled', message `${canceller?.displayName || 'A patient'} cancelled their appointment on ${dateStr} at ${appt.startTime}${reason ? ` — Reason: ${reason}` : ''}.`, data {appointmentId: id}, NO sendEmail (defaults false). If the physicianProfile is missing, NO notification at all.",
+        "Branch B — anything else (physician or staff): Notification to appt.patientUserId: same type/title, message `Your appointment on ${dateStr} at ${appt.startTime} has been cancelled${reason ? ` — Reason: ${reason}` : ''}.`, data {appointmentId: id}, sendEmail: TRUE (email fires).",
+        "dateStr = new Date(appt.appointmentDate).toLocaleDateString('en-US', {weekday:'short', month:'short', day:'numeric'}) e.g. 'Tue, Mar 10' — note NO year.",
+        "Push attempted in both branches.",
+        "NO cache invalidation of the cacheMiddleware(15) responses for GET / and GET /today."
+      ],
+      "quirks": [
+        "The em-dash in the notification message is a literal U+2014 (` — Reason: `). Must be byte-identical if notification text is compared.",
+        "Branch selection is `if (isPatient) ... else ...` — so when the SAME user is both the physician and the patient (physician booked themselves), isPatient wins and the physician notifies themselves; the patient email never fires.",
+        "Staff cancelling falls into the `else` branch, so the message reads 'Your appointment ... has been cancelled' to the patient — the staff member's name is fetched (`canceller`) but NEVER used in branch B. A dead read the port should still perform if query parity matters.",
+        "Asymmetric email: patient-cancelled sends NO email to the physician; physician/staff-cancelled DOES email the patient.",
+        "Date formatting differs from PUT /:id/confirm (explicit 'en-US' + weekday/month/day here vs bare toLocaleDateString() there). Two different formats in the same file for the same field.",
+        "No state-machine guard: cancelling an already COMPLETED or CANCELLED appointment succeeds, overwrites cancelledAt with a fresh now(), and overwrites cancelReason (so a second cancel with no body NULLS OUT the previously stored reason).",
+        "`cancelReason` is set from `reason` but the response ALSO carries the untouched `reason` column — a client reading `reason` gets the booking reason, not the cancellation reason. Easy to port wrong.",
+        "No `deletedAt` filter — soft-deleted rows are cancellable.",
+        "`reason || null` means the string '0' is kept but the number 0 becomes null (body is JSON so a numeric reason is possible after sanitization leaves non-strings alone).",
+        "Response is `{...updated, message}` — `message` last, after `deletedAt`.",
+        "Slot is NOT freed by any explicit action: availability is derived by GET /available filtering status in ['PENDING','CONFIRMED'], so cancelling implicitly frees the time. There is no TimeSlot write here.",
+        "No transaction: if the notification INSERT fails the appointment stays cancelled and 200 is returned."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/check-in",
+      "nodeLines": "L966-L1118",
+      "summary": "The heaviest endpoint in the file. Physician or active clinic staff marks a patient arrived: forces status=CONFIRMED, preserves-or-stamps confirmedAt, and APPENDS a serialized `CHECKIN:{json}` blob onto the appointment's free-text `notes` column. Then, in three independent best-effort try/catch blocks: notifies the physician, auto-inserts a WaitingQueue row, and auto-creates a PENDING CASH Payment using the clinic's consultation/follow-up fee. Returns the updated Appointment + message + checkedInBy + a 3-key payment summary (or null).",
+      "auth": "Same global chain + router.use(authCheck). In-handler: isPhysician (physicianProfile.userId match AND appt.physicianId === physician.id) OR active ClinicStaff at appt.clinicId (queried only when not the physician). Neither -> 403 with a DISTINCT message ('Not authorized to check in this patient', not the generic 'Not authorized'). The patient CANNOT check themselves in.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"clinicId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"patientUserId\": \"uuid\",\n  \"subprofileId\": \"uuid | null\",\n  \"clinicPatientId\": \"uuid | null\",\n  \"status\": \"CONFIRMED\",\n  \"appointmentDate\": \"2026-03-10T00:00:00.000Z\",\n  \"startTime\": \"09:00\",\n  \"endTime\": \"09:30\",\n  \"reason\": \"string | null\",\n  \"notes\": \"CHECKIN:{\\\"checkedInAt\\\":\\\"2026-09-03T11:22:33.456Z\\\",\\\"checkedInBy\\\":\\\"<userId>\\\",\\\"room\\\":\\\"3\\\"}\",\n  \"appointmentType\": \"IN_PERSON | VIDEO | PHONE | WALK_IN\",\n  \"confirmedAt\": \"ISO\",\n  \"completedAt\": \"ISO | null\",\n  \"cancelledAt\": \"ISO | null\",\n  \"cancelReason\": \"string | null\",\n  \"recurringRule\": \"string | null\",\n  \"recurringGroupId\": \"string | null\",\n  \"createdAt\": \"ISO\",\n  \"updatedAt\": \"ISO\",\n  \"deletedAt\": \"ISO | null\",\n  \"message\": \"Patient checked in\",\n  \"checkedInBy\": \"<acting user id>\",\n  \"payment\": {\n    \"id\": \"uuid\",\n    \"amount\": 300,\n    \"description\": \"Consultation fee\"\n  }\n}\n\n// Order: the 22 Appointment scalars (schema order) from `updated`, then `message`, then `checkedInBy`, then `payment`.\n// `payment` is EITHER that exact 3-key object (keys in order id, amount, description) OR literal null. It is null when: the clinic row was not found, a Payment already exists for this appointmentId (ANY status), the computed fee is <= 0, or the whole payment block threw.\n// `payment.amount` is a prisma Float -> JSON number. 300 serializes as `300`, NOT `300.0`. .NET decimal/double serialization must suppress the trailing .0.\n// `payment.description` is exactly \"Consultation fee\" or \"Follow-up visit fee\".\n// NO relations on the appointment: the response comes from update() with no include, so clinic / physician / subprofile / patientUser are ABSENT even though the handler fetched clinic and physician for internal use.\n// There is NO top-level `checkedInAt` — the timestamp lives only inside the embedded JSON in `notes`. GET /queue re-parses it out.\n// `notes` when the appointment already had notes: `\"<previous notes>\\nCHECKIN:{...}\"` (literal \\n newline separator).",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/malformed Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "404 {\"error\":\"Appointment not found\"} — id not found",
+        "403 {\"error\":\"Not authorized to check in this patient\"} — not the owning physician and not active clinic staff (NOTE: different string from every other endpoint's 'Not authorized')",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global limiter",
+        "500 {\"error\":\"Failed to check in patient\"} — only if the appointment read/update or the patient lookup throws; the notification, waiting-queue and payment blocks each swallow their own errors and CANNOT produce a 500"
+      ],
+      "requestBody": [
+        "room: string | number | optional | nullable — the only field read. Used as `room || null` in the notes JSON, and as ` — Room ${room}` in the notification when truthy. `room: 0` or `room: ''` is treated as absent. Client sometimes sends `{room: null}` explicitly and sometimes no body at all (both -> null).",
+        "Body strings pass through the global XSS sanitizer first."
+      ],
+      "requestQuery": [
+        "(none)"
+      ],
+      "dbWrites": [
+        "appointments UPDATE {status:'CONFIRMED', confirmedAt: appt.confirmedAt || new Date(), notes: <appended>} — NOT in a transaction",
+        "notifications INSERT (best-effort, own try/catch, logger.warn on failure)",
+        "waiting_queues INSERT (best-effort, own try/catch, logger.warn) — skipped if an entry for this clinic+patient today with status in ['WAITING','BEING_SEEN'] already exists",
+        "payments INSERT (best-effort, own try/catch, logger.warn) — skipped if any Payment already references this appointmentId, or fee <= 0",
+        "NO $transaction anywhere: the response can be 200 with the appointment updated but zero side rows written"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId for the auth gate; the appointment's own physician arrives via the include)",
+        "ClinicStaff (findFirst, only when not the physician)",
+        "User (findUnique by appt.patientUserId, select displayName — used in the notification and as WaitingQueue.patientName)",
+        "Clinic (findUnique by appt.clinicId, select {id, consultationFee, followUpFee}) — a SECOND clinic read; the include already pulled {id, name}",
+        "Visit (count where {clinicId, patientUserId, status:'COMPLETED'}) — drives the follow-up-vs-initial fee decision",
+        "Payment (findFirst by appointmentId — duplicate guard; then created)",
+        "WaitingQueue (findFirst for today's active entry, findFirst orderBy queueNumber desc for the next number, then created)",
+        "Notification (created)",
+        "User (again inside notificationService for the email address — though sendEmail is false here)"
+      ],
+      "externalDeps": [
+        "../services/notificationService (require()'d inside the try)",
+        "../services/pushService (createNotification always attempts push)",
+        "prisma, logger",
+        "no PDF/AI/multer"
+      ],
+      "sideEffects": [
+        "Notification to appt.physician.user.id: type 'PATIENT_ARRIVED', title 'Patient Arrived', message `${patient?.displayName || 'Patient'} has checked in${room ? ` — Room ${room}` : ''} (${appt.startTime})`, data {appointmentId: id, patientUserId: appt.patientUserId, room}. sendEmail NOT set (false). Note `room` in the data JSON is `undefined` when no body was sent, so the key is dropped from the stored JSON entirely.",
+        "WaitingQueue row: {clinicId: appt.clinicId, physicianUserId: appt.physician.user.id, patientUserId: appt.patientUserId, patientName: patient?.displayName || 'Patient', queueNumber: (max today for the clinic || 0) + 1, source: 'APPOINTMENT', appointmentId: id, reason: appt.reason || null, queueDate: local midnight of today}. status defaults 'WAITING', checkedInAt defaults now().",
+        "Payment row: {clinicId, physicianId (from the appointment, not the caller), patientUserId, appointmentId: id, amount: fee, currency: 'EGP', method: 'CASH', description: 'Follow-up visit fee' | 'Consultation fee', status: 'PENDING'}. amountPaid defaults 0.",
+        "Fee logic: priorVisitCount = count of COMPLETED Visits for this clinic+patient. isFollowUp = priorVisitCount > 0. fee = isFollowUp ? (clinic.followUpFee || 200) : (clinic.consultationFee || 300).",
+        "NO cache invalidation for GET / or GET /today (cacheMiddleware(15))."
+      ],
+      "quirks": [
+        "State is smuggled through free text. `notes` becomes `CHECKIN:` + JSON.stringify({checkedInAt, checkedInBy, room}) — key order checkedInAt, checkedInBy, room, and checkedInAt is an ISO string via toISOString(). GET /queue reads it back with `notes.split('CHECKIN:').pop()` + JSON.parse. The .NET port MUST produce the identical serialization (same keys, same order, no spaces) or /queue's parse silently degrades to `checkedIn=true, checkedInAt=null, room=null` via its bare `catch (_)`.",
+        "Repeated check-ins APPEND another `\\nCHECKIN:{...}` block; notes grows unboundedly. Only the LAST block is ever read back. A walk-in appointment starts with notes='WALK_IN', so it becomes 'WALK_IN\\nCHECKIN:{...}'.",
+        "`confirmedAt: appt.confirmedAt || new Date()` PRESERVES an existing confirmedAt — the opposite of PUT /:id/confirm, which overwrites it. Do not unify these.",
+        "status is FORCED to 'CONFIRMED' with no state guard: checking in a CANCELLED, COMPLETED or NO_SHOW appointment resurrects it as CONFIRMED.",
+        "Fee falsy-fallback bug worth copying verbatim: `clinic.followUpFee || 200` and `clinic.consultationFee || 300`. A clinic that deliberately set a fee of 0 gets charged 200/300 instead of being free. Only after this substitution does the `fee > 0` guard run, so `payment` is effectively never null for fee reasons unless the columns hold a negative number.",
+        "The duplicate-payment guard is `payment.findFirst({where:{appointmentId: id}})` with NO status filter — a REFUNDED or CANCELLED prior payment permanently blocks creating a new one, and `payment` comes back null on the second check-in even though the appointment updates fine.",
+        "The WaitingQueue insert IGNORES subprofileId/subprofileName even when the appointment is for a family member — the queue shows the account holder's displayName. (POST /walk-in in the same file DOES resolve the subprofile name.) A faithful port must reproduce this inconsistency.",
+        "queueNumber is computed with a read-then-increment and NO uniqueness constraint or transaction — two concurrent check-ins produce duplicate queue numbers.",
+        "`queueDate: new Date(dayStart)` where dayStart = new Date(y, m, d) in the SERVER's local timezone, then serialized to UTC. On a UTC+2 (Egypt) server this stores 22:00 of the previous UTC day. Every later `queueDate: {gte: dayStart, lte: dayEnd}` window uses the same local-midnight construction, so it is self-consistent — but a .NET port that uses UtcNow.Date will silently mismatch every existing row.",
+        "`appt.physician.user.id` is dereferenced unguarded inside the notification block AND the waiting-queue block. If the physician relation or its user is missing, both blocks throw and are swallowed — the endpoint still returns 200 with no notification and no queue row.",
+        "The clinic is read TWICE: once through the include (select {id, name}) and again with findUnique (select {id, consultationFee, followUpFee}). Neither the include's `clinic` nor `physician` appears in the response.",
+        "`checkedInBy` is a response-only key with no model backing — it is just `req.user.id` echoed.",
+        "`payment` in the response is a hand-built 3-key projection, NOT the Payment entity: no status, method, currency, clinicId, createdAt. The client reads only `res.data.payment.amount` (AssistantDashboardPage L152-160) but the extra keys must not appear.",
+        "Three independent best-effort blocks means partial success is the normal case, and there is no way for the client to tell which side effects landed.",
+        "The `catch (_)` swallow pattern in GET /queue means malformed CHECKIN JSON still reports checkedIn=true — relevant when validating the port's round-trip.",
+        "Response order is `...updated, message, checkedInBy, payment` — `payment` is LAST."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/complete",
+      "nodeLines": "L859-L888",
+      "summary": "Physician owner or active clinic staff sets status=COMPLETED and completedAt=now. No notification, no other side effects. Returns the updated Appointment plus `message`. The simplest of the status transitions.",
+      "auth": "Same global chain + router.use(authCheck). In-handler: isPhysician (physicianProfile.userId match AND appt.physicianId === physician.id) OR active ClinicStaff at appt.clinicId (queried only when not the physician). Neither -> 403 'Not authorized'. The patient CANNOT complete their own appointment.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"clinicId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"patientUserId\": \"uuid\",\n  \"subprofileId\": \"uuid | null\",\n  \"clinicPatientId\": \"uuid | null\",\n  \"status\": \"COMPLETED\",\n  \"appointmentDate\": \"2026-03-10T00:00:00.000Z\",\n  \"startTime\": \"09:00\",\n  \"endTime\": \"09:30\",\n  \"reason\": \"string | null\",\n  \"notes\": \"string | null\",\n  \"appointmentType\": \"IN_PERSON | VIDEO | PHONE | WALK_IN\",\n  \"confirmedAt\": \"ISO | null\",\n  \"completedAt\": \"2026-09-03T11:22:33.456Z\",\n  \"cancelledAt\": \"ISO | null\",\n  \"cancelReason\": \"string | null\",\n  \"recurringRule\": \"string | null\",\n  \"recurringGroupId\": \"string | null\",\n  \"createdAt\": \"ISO\",\n  \"updatedAt\": \"ISO\",\n  \"deletedAt\": \"ISO | null\",\n  \"message\": \"Appointment completed\"\n}\n\n// 22 Appointment scalars in schema order, then `message` last. No relations included.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/malformed Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "404 {\"error\":\"Appointment not found\"} — id not found",
+        "403 {\"error\":\"Not authorized\"} — not the owning physician and not active clinic staff",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global limiter",
+        "500 {\"error\":\"Failed to complete\"} — any throw ('[Appointments] Complete error')"
+      ],
+      "requestBody": [
+        "(none read — req.body is ignored entirely)"
+      ],
+      "requestQuery": [
+        "(none)"
+      ],
+      "dbWrites": [
+        "appointments UPDATE {status:'COMPLETED', completedAt: new Date()} — NOT in a transaction, single statement"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "ClinicStaff (findFirst by userId+clinicId+isActive, only when not the physician)"
+      ],
+      "externalDeps": [
+        "prisma, logger only — NO notificationService, NO email, NO push, NO pdf, NO AI"
+      ],
+      "sideEffects": [
+        "NONE. Notably: no Notification to the patient (unlike confirm and cancel), no Visit record created or linked, no Payment status change, no WaitingQueue completion, no cache invalidation."
+      ],
+      "quirks": [
+        "This is the ONLY status transition among confirm/cancel/complete that sends no notification at all. A port that 'helpfully' adds one breaks parity.",
+        "Completing an appointment does NOT mark the linked WaitingQueue entry completed, does NOT collect the PENDING payment created at check-in, and does NOT touch any Visit. GET /queue overlays live Visit status separately by patientUserId, so the queue and the appointment can disagree.",
+        "No state guard: completing an already CANCELLED or NO_SHOW appointment succeeds and overwrites completedAt; calling it twice bumps completedAt to a new now().",
+        "`cancelledAt` / `cancelReason` are NOT cleared when transitioning to COMPLETED, so a row can carry status COMPLETED with a non-null cancelledAt from an earlier cancel.",
+        "No `deletedAt` filter — soft-deleted rows are completable.",
+        "Response is `{...updated, message}` with `message` appended last; the error string is 'Failed to complete' (not 'Failed to complete appointment').",
+        "The 403 message is the generic 'Not authorized' — differs from check-in's 'Not authorized to check in this patient' and from DELETE /slots/:id's 'Not your slot'. All three strings must be preserved distinctly."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/no-show",
+      "nodeLines": "L894-L922",
+      "summary": "Physician owner or active clinic staff sets status='NO_SHOW'. Deliberately stamps NO timestamp column. Returns the updated Appointment plus a `message` whose text does not follow the pattern of its siblings.",
+      "auth": "Same global chain + router.use(authCheck). In-handler: isPhysician (physicianProfile.userId match AND appt.physicianId === physician.id) OR active ClinicStaff at appt.clinicId (queried only when not the physician). Neither -> 403 'Not authorized'. The patient cannot mark their own no-show.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"uuid\",\n  \"clinicId\": \"uuid\",\n  \"physicianId\": \"uuid\",\n  \"patientUserId\": \"uuid\",\n  \"subprofileId\": \"uuid | null\",\n  \"clinicPatientId\": \"uuid | null\",\n  \"status\": \"NO_SHOW\",\n  \"appointmentDate\": \"2026-03-10T00:00:00.000Z\",\n  \"startTime\": \"09:00\",\n  \"endTime\": \"09:30\",\n  \"reason\": \"string | null\",\n  \"notes\": \"string | null\",\n  \"appointmentType\": \"IN_PERSON | VIDEO | PHONE | WALK_IN\",\n  \"confirmedAt\": \"ISO | null\",\n  \"completedAt\": \"ISO | null\",\n  \"cancelledAt\": \"ISO | null\",\n  \"cancelReason\": \"string | null\",\n  \"recurringRule\": \"string | null\",\n  \"recurringGroupId\": \"string | null\",\n  \"createdAt\": \"ISO\",\n  \"updatedAt\": \"ISO\",\n  \"deletedAt\": \"ISO | null\",\n  \"message\": \"Marked as no-show\"\n}\n\n// 22 Appointment scalars in schema order, then `message`. No relations.\n// `updatedAt` DOES change (prisma @updatedAt), but no status-specific timestamp is written — confirmedAt/completedAt/cancelledAt keep whatever they held.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/malformed Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "404 {\"error\":\"Appointment not found\"} — id not found",
+        "403 {\"error\":\"Not authorized\"} — not the owning physician and not active clinic staff",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global limiter",
+        "500 {\"error\":\"Failed to mark no-show\"} — any throw ('[Appointments] No-show error')"
+      ],
+      "requestBody": [
+        "(none read — req.body is ignored entirely)"
+      ],
+      "requestQuery": [
+        "(none)"
+      ],
+      "dbWrites": [
+        "appointments UPDATE {status:'NO_SHOW'} — single field, no timestamp, NOT in a transaction"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "ClinicStaff (findFirst by userId+clinicId+isActive, only when not the physician)"
+      ],
+      "externalDeps": [
+        "prisma, logger only — no notification, email, push, AI or PDF"
+      ],
+      "sideEffects": [
+        "NONE — no notification to the patient, no Payment void, no WaitingQueue update, no cache invalidation."
+      ],
+      "quirks": [
+        "`message` is \"Marked as no-show\" — it breaks the 'Appointment <verb>' pattern used by confirm/cancel/complete. Do not normalize it.",
+        "Unlike every other transition, NO timestamp is recorded. There is no `noShowAt` column, so the only evidence of when this happened is `updatedAt`. GET /ai-optimize counts NO_SHOW by `appointmentDate`, not by when it was marked.",
+        "The prisma call is written on one line as `prisma.appointment.update({ where: { id }, data: { status: 'NO_SHOW' } })` — no confirmedAt/cancelledAt bookkeeping, so a previously CONFIRMED appointment keeps its confirmedAt while reading NO_SHOW.",
+        "No state guard: an already COMPLETED or CANCELLED appointment can be flipped to NO_SHOW; calling twice is a no-op except for `updatedAt`.",
+        "No `deletedAt` filter — soft-deleted rows are markable.",
+        "The enum value is the literal string 'NO_SHOW' with an underscore (not 'NOSHOW', not 'No-show'), while the ROUTE segment is the hyphenated '/no-show'. Both spellings must be preserved exactly on their respective sides.",
+        "Response is `{...updated, message}` with `message` appended after `deletedAt`."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/slots",
+      "nodeLines": "L28-L50",
+      "summary": "Physician-only listing of their own recurring weekly TimeSlots, optionally narrowed to one clinic. Returns a bare JSON ARRAY of slot objects, each carrying a nested `clinic` object containing ONLY `name`. Returns an empty array (200, not 403) for any caller without a PhysicianProfile.",
+      "auth": "Same global chain + router.use(authCheck). NO cacheMiddleware on this route (unlike GET / and GET /today, which use cacheMiddleware(15)). No userType check and no explicit 403 path: authorization is implicit — the where clause is pinned to `physicianId: physician.id` derived from req.user.id. Clinic staff and patients get `[]`.",
+      "successStatus": 200,
+      "responseShape": "[\n  {\n    \"id\": \"uuid\",\n    \"clinicId\": \"uuid\",\n    \"physicianId\": \"uuid\",\n    \"dayOfWeek\": 0,\n    \"startTime\": \"09:00\",\n    \"endTime\": \"09:15\",\n    \"slotDuration\": 15,\n    \"isActive\": true,\n    \"createdAt\": \"2026-09-03T11:22:33.456Z\",\n    \"clinic\": { \"name\": \"Cairo Clinic\" }\n  }\n]\n\n// A bare TOP-LEVEL ARRAY — not wrapped in {slots:[...]} or {data:[...]}.\n// Empty case is `[]` (never null, never {}). Two distinct paths return `[]`: no PhysicianProfile (early return), and a physician with no matching active slots.\n// Key order: the 9 TimeSlot scalars in prisma schema declaration order, then the included relation `clinic` last.\n// `clinic` is the include `{ select: { name: true } }` — EXACTLY one key, `name`. NO id, NO address, NO phone. `clinic` is never null (clinicId is a required non-nullable FK with onDelete: Cascade).\n// `dayOfWeek` is an Int 0..6 (0 = Sunday) — a NUMBER, not a string, and not validated on write so values outside 0..6 can be present.\n// `startTime` / `endTime` are STRINGS \"HH:MM\", not Date/TimeSpan.\n// `slotDuration` is an Int (minutes), DB default 30.\n// `isActive` is always `true` in this response (hard-coded filter), but the key IS present.\n// `createdAt` is an ISO-8601 UTC string with 3-digit ms and trailing Z.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/malformed Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global limiter (relevant: AppointmentsPage refetches this after every slot mutation)",
+        "500 {\"error\":\"Failed to list slots\"} — any throw ('[Appointments] List slots error')",
+        "NOTE: there is NO 400 and NO 403 on this route. An unknown/garbage clinicId, a clinicId belonging to another physician, or a non-physician caller all return 200 with []."
+      ],
+      "requestBody": [
+        "(none — GET)"
+      ],
+      "requestQuery": [
+        "clinicId: string | optional | no default — when present, added to the where clause as an exact equality. NOT validated for existence and NOT checked for ownership (safe only because physicianId already scopes the query). When omitted, slots across ALL of the physician's clinics are returned, which is why the nested `clinic.name` exists at all."
+      ],
+      "dbWrites": [
+        "(none — read-only)"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId — resolves the physician id)",
+        "Clinic (via the include's select: { name: true })"
+      ],
+      "externalDeps": [
+        "prisma, logger only"
+      ],
+      "sideEffects": [
+        "None. Note this route is NOT cached, so it always reflects the latest writes — unlike GET / and GET /today which serve up to 15s stale data from the per-user in-memory route cache."
+      ],
+      "quirks": [
+        "Silent-empty instead of 403: a non-physician (patient or clinic staff) gets `res.json([])` at 200. Clinic staff CANNOT list slots even for their own clinic. A port that returns 403 here breaks the client's `catch {}` -> setSlots([]) flow in AppointmentsPage.fetchPhysicianData.",
+        "`isActive: true` is hard-coded in the where clause, so slots soft-deleted by DELETE /slots/:id vanish here forever while their rows persist in the table. There is no query flag to see them.",
+        "Sort is `orderBy: [{dayOfWeek:'asc'}, {startTime:'asc'}]` — and `startTime` is a VARCHAR, so this is a LEXICOGRAPHIC sort, not a time sort. It only coincides with chronological order because the generators zero-pad. Slots created via POST /slots (which stores the client's raw `s.startTime` with no padding or validation) can hold \"9:00\", which sorts AFTER \"10:00\". A .NET port must sort by the string under a comparable collation, NOT by a parsed TimeSpan, or the row order changes.",
+        "SQL Server collation caveat: the Node source is PostgreSQL (`provider = \"postgresql\"`). Postgres string ordering under the DB collation vs SQL Server's default collation agree for zero-padded \"HH:MM\", but not necessarily for the unpadded/garbage values POST /slots permits.",
+        "No deduplication. POST /slots/sync-from-hours can create overlapping duplicate slots for the same day+time (no unique constraint on TimeSlot), and this endpoint returns every one of them. Contrast GET /available (L316-322), which dedupes by startTime — so the physician's slot grid and the patient's booking grid can show different counts for the same data.",
+        "The nested key is `clinic`, not `clinicName` — the client would have to read `slot.clinic.name`. Do not flatten it.",
+        "No pagination and no `take` limit (contrast GET / which caps at 200). A physician with 15-minute slots across 7 days at multiple clinics can return several hundred objects.",
+        "The app sets `app.set('etag', 'strong')` globally, so this response can come back as 304 Not Modified with an empty body. The .NET port must either reproduce a matching strong ETag or accept that the client's caching behavior changes.",
+        "`compression()` gzips responses over 1KB — a large slot list arrives gzipped. Byte-identity is about the decompressed JSON.",
+        "The physician lookup uses findUnique on the `userId @unique` field, so exactly zero or one profile; there is no multi-profile case to handle."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/slots/bulk",
+      "nodeLines": "L126-L178",
+      "summary": "Generates a whole day's worth of TimeSlots by walking a [startTime, endTime) window in slotDuration steps. DESTRUCTIVE FIRST: it hard-deletes every existing slot for that physician+clinic+dayOfWeek (including soft-deleted ones) before generating, and it does so OUTSIDE any transaction — so a request that ends in 400 or 500 has already wiped the day. Returns a count, not the created rows.",
+      "auth": "Same global chain + router.use(authCheck). In-handler: physicianProfile.findUnique({userId}) must exist (else 400, not 403), then clinic.findFirst({id: clinicId, physicianId: physician.id}) must match (else 403 'Not your clinic'). Clinic STAFF cannot use this endpoint — they fail the physician check with a 400 'Physician profile required'.",
+      "successStatus": 201,
+      "responseShape": "{\n  \"count\": 32,\n  \"message\": \"32 slots created\"\n}\n\n// Exactly two keys, in this order. `count` is prisma createMany().count (an Int). `message` is the template literal `${created.count} slots created` — so the number appears TWICE, always in agreement, and the word is always plural even for 1 (\"1 slots created\").\n// The created TimeSlot rows are NOT returned. The client must refetch GET /slots.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/malformed Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "400 {\"error\":\"All fields required\"} when `!clinicId || dayOfWeek === undefined || !startTime || !endTime`. NOTE the guard is `=== undefined`, chosen so dayOfWeek 0 (Sunday) passes — but it also lets `null` through.",
+        "400 {\"error\":\"Physician profile required\"} when the caller has no PhysicianProfile (staff/patients land here — a 400, NOT a 403)",
+        "403 {\"error\":\"Not your clinic\"} when the clinic does not exist OR is not owned by this physician (existence and ownership are conflated into one 403 — there is no 404)",
+        "400 {\"error\":\"Time range too short for slot duration\"} when the generation loop produced zero slots — RETURNED AFTER the deleteMany has already run",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global limiter; AppointmentsPage fires one POST per selected weekday via Promise.all, so selecting 7 days is 7 requests against the 100/min/IP budget",
+        "500 {\"error\":\"Failed to create bulk slots\"} — any throw, e.g. createMany rejecting a NaN dayOfWeek ('[Appointments] Bulk slots error')"
+      ],
+      "requestBody": [
+        "clinicId: string | REQUIRED (truthy check)",
+        "dayOfWeek: number | string | REQUIRED (checked only with `=== undefined`; stored as parseInt(dayOfWeek); NOT range-validated, so 7, 99 or -1 are accepted and persisted)",
+        "startTime: string \"HH:MM\" | REQUIRED (truthy check only; NO format validation — parsed with `startTime.split(':').map(Number)`)",
+        "endTime: string \"HH:MM\" | REQUIRED (same, no validation)",
+        "slotDuration: number | optional | default 30 via `slotDuration || 30` — so an explicit 0 becomes 30. NOT parseInt'd (see quirks)."
+      ],
+      "requestQuery": [
+        "(none)"
+      ],
+      "dbWrites": [
+        "time_slots DELETE MANY where {physicianId, clinicId, dayOfWeek: parseInt(dayOfWeek)} — a HARD delete, runs BEFORE validation of the time range, NOT in a transaction",
+        "time_slots INSERT MANY via prisma.createMany — NOT in a transaction with the delete"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "Clinic (findFirst by {id, physicianId} — ownership check)"
+      ],
+      "externalDeps": [
+        "prisma, logger only — no notification, no AI, no PDF"
+      ],
+      "sideEffects": [
+        "Irreversibly hard-deletes the day's existing slots for that clinic. Because TimeSlot has no FK from Appointment, existing bookings are NOT cascaded or invalidated — appointments survive with no backing slot.",
+        "No notification to patients whose availability just changed.",
+        "No cache invalidation (GET /slots is uncached anyway, but GET / and GET /today keep their 15s cache)."
+      ],
+      "quirks": [
+        "DESTRUCTIVE-THEN-FAIL, no transaction: the deleteMany at L138-140 runs before the loop. If the range yields zero slots you get 400 'Time range too short for slot duration' with the day's slots ALREADY GONE. Same for a 500 from createMany. This is the single most important behavior to port verbatim — a .NET version that validates first, or wraps in a transaction, will diverge on every malformed request.",
+        "The deleteMany has NO `isActive` filter, so it purges soft-deleted rows too. DELETE /slots/:id soft-deletes (isActive=false); bulk is the only thing that ever physically removes rows.",
+        "Type-coercion trap: `slotDuration` is used as `duration` WITHOUT parseInt. If the client sends the string \"15\", then `currentMinutes + duration` is STRING CONCATENATION — 540 + \"15\" = \"54015\" — and `\"54015\" <= endMinutes` coerces back to 54015, which is false. The loop never runs and you get 400 (after the delete). The current client sends `parseInt(...) || 15` so it works today, but the port must reproduce this or it will accept requests Node rejects. (`dayOfWeek` IS parseInt'd; `slotDuration` is not — the asymmetry is real.)",
+        "Negative slotDuration is an INFINITE LOOP: with duration = -30, `currentMinutes + duration <= endMinutes` stays true while currentMinutes decreases forever, pushing into `slots` until the process dies. Not guarded. A .NET port should decide deliberately (a guard changes behavior; no guard reproduces the hang).",
+        "Loop bound is `while (currentMinutes + duration <= endMinutes)` — INCLUSIVE of a slot that ends exactly at endTime, EXCLUSIVE of any partial trailing slot. 09:00-10:00 at 15min yields exactly 4 slots (09:00,09:15,09:30,09:45) with the last ending 10:00.",
+        "No overnight support: endTime <= startTime makes endMinutes < currentMinutes, the loop never runs, and you get 400 (post-delete). 22:00->02:00 is impossible.",
+        "Malformed times fail SOFTLY into the same 400: `Number('abc')` -> NaN -> `NaN + 30 <= x` is false -> zero slots -> 400 'Time range too short for slot duration'. The error text lies about the cause.",
+        "Times with only hours (\"9\") parse as startM = undefined -> `Number(undefined)` = NaN -> same NaN path. Times like \"09:00:00\" parse fine (the third segment is ignored by destructuring).",
+        "Generated startTime/endTime are ALWAYS zero-padded 2-digit via String(...).padStart(2,'0') — e.g. \"09:05\". This padding is what keeps GET /slots' lexicographic ordering correct; the port must pad identically.",
+        "`dayOfWeek: null` slips past the `=== undefined` guard, then `parseInt(null)` is NaN, then createMany throws on the Int column -> 500 'Failed to create bulk slots' — again after the deleteMany.",
+        "No range check on dayOfWeek: 99 is stored and will simply never match GET /available's `targetDate.getDay()`, so those slots are invisible to patients but visible in GET /slots.",
+        "Success is 201 with a body of {count, message}. Contrast POST /slots/sync-from-hours, which does essentially the same work but returns 200. The status codes differ between the two sibling endpoints — do not unify.",
+        "`message` pluralization is never adjusted: count 1 yields \"1 slots created\".",
+        "createMany does NOT deduplicate and TimeSlot has NO unique constraint — but because the day is wiped first, duplicates only arise from concurrent requests for the same day.",
+        "Body strings (startTime, endTime) have already passed through the global XSS sanitizer, which rewrites 'url(' to 'url\\(' among other things — irrelevant for well-formed times but part of the input pipeline."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/slots/sync-from-hours",
+      "nodeLines": "L183-L248",
+      "summary": "Replaces a clinic's ENTIRE weekly slot grid from a structured schedule array, then writes that array back onto Clinic.workingHours. Wipes ALL slots for the physician+clinic (every day, hard delete) before regenerating. Silently skips malformed schedule entries instead of erroring, defaults slotDuration to 15 (not 30), and returns 200 (not 201) with a count.",
+      "auth": "Same global chain + router.use(authCheck). In-handler: physicianProfile.findUnique({userId}) must exist (else 400 'Physician profile required'), then clinic.findFirst({id: clinicId, physicianId: physician.id}) must match (else 403 'Not your clinic'). Clinic staff cannot call this. Note this endpoint WRITES to the Clinic table while living in the appointments router — it is the only cross-module write here.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"count\": 96,\n  \"message\": \"96 slots created\"\n}\n\n// Exactly two keys in this order. `count` is 0 when nothing was generated (createMany is skipped entirely and createCount stays 0) — the response is still 200 with {\"count\":0,\"message\":\"0 slots created\"}.\n// The created rows are NOT returned; neither is the updated clinic. The client (ClinicDetailPage.handleSaveSchedule) ignores the body and refetches the clinic.\n// Always plural in the message, even for 1.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/malformed Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "400 {\"error\":\"clinicId and a schedule array are required\"} when `!clinicId || !schedule || !Array.isArray(schedule)`. NOTE the exact wording includes the article 'a' — it is NOT the same string as bulk's 'All fields required'. An EMPTY array [] is truthy and passes this guard.",
+        "400 {\"error\":\"Physician profile required\"} when the caller has no PhysicianProfile (400, not 403)",
+        "403 {\"error\":\"Not your clinic\"} when the clinic does not exist or is not owned by this physician (no 404 path)",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global limiter",
+        "500 {\"error\":\"Failed to sync slots\"} — any throw, e.g. createMany rejecting a NaN dayOfWeek, or the clinic.update failing ('[Appointments] Sync from hours error')",
+        "NOTE: there is NO error for a malformed individual schedule entry and NO 'range too short' 400 — unlike bulk, zero generated slots is a SUCCESS here."
+      ],
+      "requestBody": [
+        "clinicId: string | REQUIRED (truthy)",
+        "schedule: array | REQUIRED (must be Array.isArray; [] is accepted and means 'delete everything')",
+        "schedule[].dayOfWeek: number | string | required-per-entry (entry skipped via `continue` when `dayOfWeek === undefined`; stored as parseInt)",
+        "schedule[].startTime: string \"HH:MM\" | required-per-entry (entry skipped when falsy; no format validation)",
+        "schedule[].endTime: string \"HH:MM\" | required-per-entry (entry skipped when falsy; no format validation)",
+        "schedule[].slotDuration: number | optional | DEFAULT 15 via `slotDuration || 15` — note this differs from POST /slots/bulk's default of 30 and from the DB column default of 30",
+        "Extra/unknown keys on a schedule entry are ignored for slot generation but ARE persisted verbatim into Clinic.workingHours (the whole array is stringified)."
+      ],
+      "requestQuery": [
+        "(none)"
+      ],
+      "dbWrites": [
+        "time_slots DELETE MANY where {physicianId, clinicId} — ALL days, HARD delete, no isActive filter, runs before any generation, NOT in a transaction",
+        "time_slots INSERT MANY via createMany — skipped entirely when allSlots.length === 0",
+        "clinics UPDATE {workingHours: JSON.stringify(schedule)} — runs AFTER the slot writes, NOT in a transaction with them"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)",
+        "Clinic (findFirst by {id, physicianId} for ownership, then UPDATEd — a cross-module write into the clinics table from the appointments router)"
+      ],
+      "externalDeps": [
+        "prisma, logger only"
+      ],
+      "sideEffects": [
+        "Clinic.workingHours is overwritten with a DOUBLE-ENCODED JSON string (see quirks) — this is how ClinicDetailPage, ClinicsPage, DoctorSchedulePage and GET /newsfeed later read the schedule.",
+        "The clinic's entire weekly availability is destroyed and rebuilt. Existing Appointments are untouched (no FK from Appointment to TimeSlot), so bookings can outlive the slots that justified them.",
+        "No notification to patients or staff.",
+        "No cache invalidation."
+      ],
+      "quirks": [
+        "DOUBLE-ENCODED JSON — the single most portable-breaking detail: `workingHours` is a prisma `Json?` column, but the handler writes `JSON.stringify(schedule)`, i.e. a JSON *string scalar* containing serialized JSON, not a JSON array. The client relies on this: ClinicDetailPage L82 does `JSON.parse(response.data.workingHours)`. A .NET port that stores the array as real JSON will make the client's JSON.parse throw. Other clinic write paths (routes/clinics.js L1091, L786) assign `workingHours` RAW, so the column legitimately holds BOTH shapes — hence the `typeof clinic.workingHours === 'string' ? ... : ...` branches all over the client.",
+        "DESTRUCTIVE-THEN-MAYBE-FAIL, no transaction: the deleteMany wipes ALL days for the clinic first. If createMany then throws (e.g. a null dayOfWeek -> parseInt(null) = NaN on an Int column), you get 500 with every slot gone AND workingHours still holding the previous value — a fully inconsistent state. If clinic.update throws, the slots are rebuilt but workingHours is stale.",
+        "An EMPTY schedule array is a legal 'delete everything' request: `[]` passes the Array.isArray guard, deleteMany runs, allSlots is empty so createMany is skipped, workingHours becomes the string \"[]\", and the response is 200 {\"count\":0,\"message\":\"0 slots created\"}.",
+        "Malformed entries are SILENTLY SKIPPED with `continue` (when dayOfWeek is undefined or startTime/endTime falsy). No warning, no partial-failure signal — the client cannot tell 3 of 7 days were dropped, it only sees a lower count.",
+        "A time range too short for its duration also silently contributes zero slots for that entry, with no error — the exact opposite of POST /slots/bulk, which 400s in the same situation.",
+        "slotDuration default is 15 here vs 30 in POST /slots/bulk and POST /slots and the DB default. Three different defaults for the same column in one file.",
+        "Same string-concatenation trap as bulk: `slotDuration` is NOT parseInt'd, so a string \"15\" makes `currentMinutes + duration` concatenate and the entry silently yields zero slots. The client sends `Number(slotDuration)` so it works today.",
+        "Same infinite-loop exposure as bulk for a negative slotDuration.",
+        "Returns 200, while its sibling POST /slots/bulk returns 201 for the same kind of work. Preserve the difference.",
+        "NO deduplication across schedule entries and NO unique constraint on TimeSlot: two entries with the same dayOfWeek and overlapping windows both generate, producing duplicate startTimes. GET /slots shows every duplicate; GET /available dedupes by startTime. So the physician's grid and the patient's grid disagree.",
+        "Loop bound `while (currentMinutes + duration <= endMinutes)` — inclusive of a slot ending exactly at endTime, no partial trailing slot. Generated times are zero-padded 2-digit.",
+        "dayOfWeek is not range-checked; parseInt of a non-numeric string yields NaN and a 500 from createMany.",
+        "The deleteMany scopes on {physicianId, clinicId} only — if a clinic somehow has slots owned by a different physicianId they survive the wipe and coexist with the new grid.",
+        "Body strings pass through the global XSS sanitizer BEFORE being stringified into workingHours, so the persisted schedule can contain sanitizer-mangled text (e.g. 'url(' -> 'url\\('). The port must sanitize identically to store identical bytes.",
+        "This handler has no JSDoc comment block above it (unlike its siblings) — the only documentation is the section banner at L180-182."
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/slots/:id",
+      "nodeLines": "L96-L115",
+      "summary": "SOFT-deletes one TimeSlot by setting isActive = false. Physician-owner only. Returns a bare message object — no entity, no id. Because GET /slots hard-filters isActive: true, the slot disappears from every read path while its row survives forever (only POST /slots/bulk and /slots/sync-from-hours ever physically remove rows).",
+      "auth": "Same global chain + router.use(authCheck). In-handler: timeSlot.findUnique({id}) -> 404 if missing; then physicianProfile.findUnique({userId}) and the combined check `!physician || slot.physicianId !== physician.id` -> 403 'Not your slot'. So 'no physician profile at all' and 'someone else's slot' produce the SAME 403. There is no clinic-level or staff-level authorization — clinic staff always get 403.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"message\": \"Slot removed\"\n}\n\n// A single key. The deleted/updated TimeSlot is NOT returned, its id is NOT echoed, and there is no `count`, `success` or `deleted` key. The word is \"removed\", not \"deleted\" — and the route verb is DELETE while the DB operation is an UPDATE.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} — missing/malformed Authorization header",
+        "401 {\"error\":\"Invalid token\"} — jwt.verify throws",
+        "404 {\"error\":\"Slot not found\"} — timeSlot.findUnique({where:{id}}) returned null (note: 'Slot not found', not 'Time slot not found')",
+        "403 {\"error\":\"Not your slot\"} — caller has no PhysicianProfile OR the slot belongs to another physician (both collapse into this one string; distinct from the generic 'Not authorized' used by the appointment routes)",
+        "429 {\"error\":\"Too many requests, please try again later\"} — global limiter. VERY relevant here: AppointmentsPage's 'Clear all slots' and 'Delete day slots' fire `Promise.all(slots.map(s => api.delete(...)))`, one HTTP request PER SLOT. A week of 15-minute slots is hundreds of parallel DELETEs against the 100/min/IP budget, so partial failure with 429s is the expected real-world behavior.",
+        "500 {\"error\":\"Failed to remove slot\"} — any throw ('[Appointments] Delete slot error')"
+      ],
+      "requestBody": [
+        "(none read)"
+      ],
+      "requestQuery": [
+        "(none)"
+      ],
+      "dbWrites": [
+        "time_slots UPDATE {isActive: false} where {id} — a SOFT delete, NOT a row deletion, NOT in a transaction"
+      ],
+      "crossModelReads": [
+        "PhysicianProfile (findUnique by userId)"
+      ],
+      "externalDeps": [
+        "prisma, logger only"
+      ],
+      "sideEffects": [
+        "None beyond the flag flip. Existing Appointments at that time are NOT cancelled and NOT notified — Appointment has no FK to TimeSlot. The patient simply stops seeing the slot in GET /available (which filters isActive: true).",
+        "No notification, no audit row (the auditLog middleware in server/src/middleware/audit.js exists but is NOT wired into this router).",
+        "No cache invalidation (GET /slots is uncached)."
+      ],
+      "quirks": [
+        "DELETE performs an UPDATE. The row is never removed. This asymmetry matters: soft-deleted rows accumulate and are then silently purged by POST /slots/bulk / POST /slots/sync-from-hours, whose deleteMany calls carry NO isActive filter.",
+        "Fully idempotent-looking but not idempotent in the HTTP sense: a second DELETE on the same id still finds the row (findUnique ignores isActive) and returns 200 {\"message\":\"Slot removed\"} again, re-writing isActive: false. It never 404s after the first delete.",
+        "The two failure modes 'you are not a physician' and 'this slot is not yours' are indistinguishable to the client — both are 403 'Not your slot'. Do not split them.",
+        "404 is checked BEFORE authorization, so an unauthenticated-but-valid-token caller can probe slot-id existence: a real id yields 403, a fake id yields 404. Existing behavior; the port must keep the order to stay byte-identical.",
+        "No clinic scoping: authorization is purely `slot.physicianId === physician.id`, so a physician can delete a slot at a clinic they no longer own.",
+        "Response has no id, so the client cannot reconcile which of its parallel deletes succeeded — it just refetches GET /slots.",
+        "Error strings are route-specific: 'Slot not found' / 'Not your slot' / 'Failed to remove slot'. None of them match the appointment routes' 'Appointment not found' / 'Not authorized' / 'Failed to ...' family.",
+        "Route order: this DELETE at L96 precedes DELETE /:id at L928, but they can never collide — '/slots/xxx' is two path segments and '/:id' matches only one. Similarly POST /slots (L57) cannot shadow POST /slots/bulk (L126) or POST /slots/sync-from-hours (L183), since Express '/slots' matches that exact single segment only. There is NO GET /:id and NO PUT /:id in this router, so none of the reported endpoints are shadowed."
+      ]
+    }
+  ]
+}

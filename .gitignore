@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# Runtime
+logs/
+uploads/
+
+# Secrets — never commit. Use `dotnet user-secrets` or environment variables.
+appsettings.*.local.json
+*.pfx

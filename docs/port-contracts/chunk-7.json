@@ -1,0 +1,416 @@
+{
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/:id/investigations",
+      "nodeLines": "L1129-L1162",
+      "summary": "Physician creates an Investigation row attached to visit :id. No AI, no notifications, no transaction. Returns the freshly created Investigation with all 12 scalar columns (no relations included).",
+      "auth": "router.use(authCheck) only (JWT Bearer -> req.user). No aiUsageCheck, no auditLog. In-handler gate: visit must exist, then prisma.physicianProfile.findUnique({userId: req.user.id}) must exist AND visit.physicianId === physician.id. No userType check — a PATIENT-typed user with a PhysicianProfile row would pass. No visit.status check: investigations CAN be added to a COMPLETED or ARCHIVED visit server-side (the client hides the UI, the server does not enforce it). No organization/tenant check.",
+      "successStatus": 201,
+      "responseShape": "{\n  \"id\": \"<uuid>\",\n  \"visitId\": \"<uuid, always == :id param>\",\n  \"subprofileId\": \"<uuid> | null\",\n  \"type\": \"BLOOD_WORK\",\n  \"name\": \"CBC\",\n  \"instructions\": \"<string> | null\",\n  \"status\": \"REQUESTED\",\n  \"resultUrl\": null,\n  \"resultNotes\": null,\n  \"requestedAt\": \"2026-09-03T10:15:30.123Z\",\n  \"completedAt\": null,\n  \"updatedAt\": \"2026-09-03T10:15:30.123Z\"\n}\n\nExactly these 12 keys, in this order (Prisma emits schema declaration order — server/prisma/schema.prisma L882-L903). No `visit`, no `subprofile`, no `createdAt` (the model has no createdAt — it has requestedAt instead). On a brand-new row resultUrl/resultNotes/completedAt are ALWAYS null and status is ALWAYS \"REQUESTED\" (DB defaults; the handler never accepts them from the body). requestedAt and updatedAt are DB-generated and will be equal-ish but not necessarily byte-identical.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} when Authorization header missing or not starting with \"Bearer \"",
+        "401 {\"error\":\"Invalid token\"} when jwt.verify throws",
+        "400 {\"error\":\"type and name are required\"} when !type || !name (falsy check — empty string, 0, null all fail)",
+        "404 {\"error\":\"Visit not found\"} when no Visit row with that id",
+        "403 {\"error\":\"Not your visit\"} when caller has no PhysicianProfile, or visit.physicianId !== that profile's id",
+        "500 {\"error\":\"Failed to create investigation\"} on any thrown error, including FK violation when subprofileId does not exist, and enum violation if a caller-supplied value breaks Prisma"
+      ],
+      "requestBody": [
+        "type: string (REQUIRED, free text — NOT an enum in the DB; client vocabulary is BLOOD_WORK | X_RAY | MRI | CT_SCAN | ULTRASOUND | LAB | URINE | OTHER but the server accepts any non-empty string)",
+        "name: string (REQUIRED, free text, no trim, no length cap)",
+        "instructions: string | null (optional; `instructions || null` so empty string is stored as null)",
+        "subprofileId: string | null (optional; resolution order `subprofileId || visit.subprofileId || null`)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "investigations (INSERT) — single prisma.investigation.create, NOT in a transaction"
+      ],
+      "crossModelReads": [
+        "Visit",
+        "PhysicianProfile"
+      ],
+      "externalDeps": [],
+      "sideEffects": [
+        "None. No notification, no audit row, no cache invalidation, no ClinicPatient.lastVisitDate touch."
+      ],
+      "quirks": [
+        "Route param is `:invId` in the sibling PUT/DELETE, not `:investigationId` — but this POST takes only `:id`.",
+        "Path as written in the router is `/:id/investigations` (client sees /api/visits/:id/investigations).",
+        "`type` is a plain String column with NO enum and NO whitelist — any string is persisted verbatim. A .NET port must not introduce an enum here or existing rows/clients break.",
+        "`name` is stored untrimmed. The CLIENT trims for its own validation (`newInv.name.trim()`) but sends the raw value, so \"  CBC  \" is persisted with the spaces.",
+        "`instructions: instructions || null` — an empty string from the client collapses to null. The client explicitly sends `instructions: instructions || null` too, so null is the common case.",
+        "subprofileId silently falls back to `visit.subprofileId` when the body omits it (or sends null/empty). It is NOT validated against the visit's own subprofile — a caller can attach an investigation to an arbitrary FamilySubprofile id, and the only guard is the FK, which surfaces as a 500, not a 400.",
+        "The model has `requestedAt` (@default(now())), NOT `createdAt`. Response key is `requestedAt`.",
+        "`status` defaults to REQUESTED via the Prisma/DB default — the handler never writes it. Enum InvestigationStatus = REQUESTED | IN_PROGRESS | COMPLETED | CANCELLED (schema L1141).",
+        "201 (not 200) on success — this is the only one of the three investigation routes that is not 200.",
+        "The 403 message is \"Not your visit\" even when the real cause is \"you are not a physician at all\" — the two cases are indistinguishable to the client.",
+        "No visit.status guard: POSTing to a COMPLETED visit succeeds with 201. The read side (GET /:id) will then include the new investigation for the patient too.",
+        "Ownership is checked AFTER the 404, so a valid-looking id belonging to another physician returns 403, while a nonexistent id returns 404 — the port must keep that ordering to avoid leaking existence differently.",
+        "The client's \"use template\" flow fires this endpoint once per template item in a sequential for-loop (client/src/components/InvestigationPanel.jsx L88-L95) — expect N separate POSTs, no batch endpoint.",
+        "All DateTime values serialize through Express res.json as ISO-8601 UTC with exactly 3 fractional digits and a trailing Z (e.g. \"2026-09-03T10:15:30.123Z\"). .NET's default DateTime serialization emits 7 fractional digits and must be pinned to 3."
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/:id/investigations/:invId",
+      "nodeLines": "L1168-L1205",
+      "summary": "Physician updates an investigation's status and/or resultNotes. Verifies the investigation belongs to the visit (IDOR guard) before updating. Returns the full updated Investigation row.",
+      "auth": "router.use(authCheck) only. No aiUsageCheck, no auditLog. In-handler gate: visit exists -> caller has a PhysicianProfile AND visit.physicianId === physician.id -> investigation must exist with {id: invId, visitId: id}. No visit.status check (a COMPLETED visit's investigations are still editable server-side).",
+      "successStatus": 200,
+      "responseShape": "{\n  \"id\": \"<uuid, == :invId>\",\n  \"visitId\": \"<uuid, == :id>\",\n  \"subprofileId\": \"<uuid> | null\",\n  \"type\": \"BLOOD_WORK\",\n  \"name\": \"CBC\",\n  \"instructions\": \"<string> | null\",\n  \"status\": \"COMPLETED\",\n  \"resultUrl\": \"<string> | null\",\n  \"resultNotes\": \"<string> | null\",\n  \"requestedAt\": \"2026-09-03T10:15:30.123Z\",\n  \"completedAt\": \"2026-09-03T11:02:00.000Z\" | null,\n  \"updatedAt\": \"2026-09-03T11:02:00.000Z\"\n}\n\nSame 12 keys, same order, as the POST response. No relations. `resultUrl` is never written by this handler but is echoed back (it is set elsewhere, by the patient result-upload flow).",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "404 {\"error\":\"Visit not found\"} when the Visit row does not exist",
+        "403 {\"error\":\"Not your visit\"} when caller has no PhysicianProfile or does not own the visit",
+        "404 {\"error\":\"Investigation not found for this visit\"} when no Investigation matches {id: invId, visitId: id} — note the DIFFERENT message from the visit 404",
+        "500 {\"error\":\"Failed to update investigation\"} on any throw, notably when `status` is not a valid InvestigationStatus enum value (Prisma rejects it) — an invalid status is a 500, NOT a 400"
+      ],
+      "requestBody": [
+        "status: string (optional; must be one of REQUESTED | IN_PROGRESS | COMPLETED | CANCELLED or the request 500s)",
+        "resultNotes: string | null (optional; `!== undefined` check, so null and \"\" ARE both written through)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "investigations (UPDATE) — single prisma.investigation.update, NOT in a transaction; updatedAt is auto-bumped by @updatedAt on every call even when data is {}"
+      ],
+      "crossModelReads": [
+        "Visit",
+        "PhysicianProfile"
+      ],
+      "externalDeps": [],
+      "sideEffects": [
+        "None. No notification to the patient when a result is marked COMPLETED, no audit row, no cache invalidation."
+      ],
+      "quirks": [
+        "Path as written is `/:id/investigations/:invId` — the second param is named `invId`, NOT `investigationId`.",
+        "ASYMMETRIC FALSY CHECKS: `if (status) updateData.status = status` (truthy) but `if (resultNotes !== undefined) updateData.resultNotes = resultNotes` (defined). So sending status: \"\" or null is SILENTLY IGNORED (no error, 200 with the old status), while resultNotes: null clears the column and resultNotes: \"\" writes an empty string.",
+        "completedAt is set to now() when `status === 'COMPLETED'` — but it is NEVER cleared. Moving an investigation from COMPLETED back to REQUESTED / IN_PROGRESS / CANCELLED leaves the old completedAt timestamp in place. A faithful port must reproduce this stale-timestamp behavior.",
+        "`updateData` is computed BEFORE the ownership/existence checks (L1180-L1183 before L1186). Harmless to output, but the order is not the obvious one.",
+        "An empty body ({}) yields updateData = {} and prisma.update still runs — the row's `updatedAt` is bumped and 200 is returned with an otherwise-unchanged row. It is NOT a no-op.",
+        "The two 404s carry DIFFERENT bodies: \"Visit not found\" vs \"Investigation not found for this visit\". Do not collapse them.",
+        "The IDOR guard uses findFirst({id: invId, visitId: id}) and then update({where:{id: invId}}) — two queries, no transaction. Theoretically racy but the contract is what matters here.",
+        "No enum validation in the handler: a bogus status reaches Prisma and produces 500 {\"error\":\"Failed to update investigation\"}. A .NET port that model-binds an enum and returns 400 would break the client's error text.",
+        "No visit.status guard — investigations on a COMPLETED visit are still mutable.",
+        "The client only ever sends `{ status: newStatus }` from this route (client/src/components/InvestigationPanel.jsx L126); resultNotes is accepted by the API but not exercised by this component.",
+        "DateTime serialization: ISO-8601 UTC, exactly 3 fractional digits, trailing Z."
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/:id/investigations/:invId",
+      "nodeLines": "L1211-L1233",
+      "summary": "Physician hard-deletes an investigation scoped to the visit. Uses deleteMany so a miss is not an error. Always returns {success:true} on 200.",
+      "auth": "router.use(authCheck) only. No aiUsageCheck, no auditLog. In-handler gate: visit exists -> caller has a PhysicianProfile AND visit.physicianId === physician.id. No visit.status check.",
+      "successStatus": 200,
+      "responseShape": "{ \"success\": true }\n\nExactly one key. The deleteMany result count is DISCARDED — the response never tells the client whether anything was actually removed.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "404 {\"error\":\"Visit not found\"} when the Visit row does not exist",
+        "403 {\"error\":\"Not your visit\"} when caller has no PhysicianProfile or does not own the visit",
+        "500 {\"error\":\"Failed to delete investigation\"} on any throw"
+      ],
+      "requestBody": [],
+      "requestQuery": [],
+      "dbWrites": [
+        "investigations (DELETE, deleteMany scoped by {id: invId, visitId: id}) — hard delete, NOT a soft delete, NOT in a transaction"
+      ],
+      "crossModelReads": [
+        "Visit",
+        "PhysicianProfile"
+      ],
+      "externalDeps": [],
+      "sideEffects": [
+        "Hard row removal. No notification, no audit row, no cascade beyond the row itself (Investigation has no children)."
+      ],
+      "quirks": [
+        "Path as written is `/:id/investigations/:invId`.",
+        "NO 404 FOR A MISSING INVESTIGATION. `deleteMany` returns {count: 0} and the handler still responds 200 {\"success\":true}. Deleting a nonexistent id, an already-deleted id, or an id belonging to a DIFFERENT visit all return the same 200 success body. A .NET port using a single-entity delete that 404s would break the client's idempotent-retry behavior.",
+        "This is the ONLY endpoint in this group whose success body is `{success: true}` — the sibling routes return entities. Do not normalize it to 204 No Content or to a message envelope.",
+        "The deleteMany count is intentionally unused; there is no `deleted` or `count` key in the response.",
+        "Hard delete, unlike the visit routes in the same file which soft-delete via status='ARCHIVED'.",
+        "No visit.status guard — investigations can be deleted off a COMPLETED visit.",
+        "Ownership is checked at the VISIT level only; the investigation-to-visit scoping is enforced by the deleteMany `where`, which is why a cross-visit id degrades to a silent no-op rather than a 403."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/specialty-template",
+      "nodeLines": "L32-L55",
+      "summary": "Returns the specialty exam template matched to the caller's PhysicianProfile.specialty, plus a summary list of all 11 templates for the picker dropdown. Pure config read from server/src/config/specialtyTemplates.js — no template data in the DB.",
+      "auth": "router.use(authCheck) only. NO physician/userType gate — any authenticated user (including a PATIENT) may call it; a caller without a PhysicianProfile just gets the degenerate body. Declared at L32, BEFORE router.get('/:id') at L272, so it is not shadowed.",
+      "successStatus": 200,
+      "responseShape": "— Physician WITH a PhysicianProfile (the normal case), 3 keys in this order: —\n{\n  \"template\": {\n    \"key\": \"ophthalmology\",\n    \"label\": \"Ophthalmology Exam\",\n    \"icon\": \"👁️\",\n    \"sections\": [\n      { \"title\": \"Visual Acuity\", \"paired\": true, \"fields\": [\n          { \"key\": \"va_uncorrected_od\", \"label\": \"VA Uncorrected (OD)\", \"type\": \"text\", \"placeholder\": \"6/6\" },\n          { \"key\": \"va_uncorrected_os\", \"label\": \"VA Uncorrected (OS)\", \"type\": \"text\", \"placeholder\": \"6/6\" },\n          { \"key\": \"va_corrected_od\",   \"label\": \"BCVA (OD)\",           \"type\": \"text\", \"placeholder\": \"6/6\" },\n          { \"key\": \"va_corrected_os\",   \"label\": \"BCVA (OS)\",           \"type\": \"text\", \"placeholder\": \"6/6\" } ] },\n      { \"title\": \"Intraocular Pressure\", \"paired\": true, \"fields\": [\n          { \"key\": \"iop_od\", \"label\": \"IOP (OD)\", \"type\": \"number\", \"unit\": \"mmHg\", \"placeholder\": \"14\" },\n          { \"key\": \"iop_os\", \"label\": \"IOP (OS)\", \"type\": \"number\", \"unit\": \"mmHg\", \"placeholder\": \"14\" } ] },\n      { \"title\": \"Pupil & Refraction\", \"paired\": true, \"fields\": [ ...4 text fields... ] },\n      { \"title\": \"Anterior Segment (Slit Lamp)\", \"paired\": true, \"fields\": [ ...2 textarea fields... ] },\n      { \"title\": \"Fundus Examination\", \"paired\": true, \"fields\": [ ...2 textarea fields... ] }\n    ]\n  },\n  \"specialty\": \"Ophthalmology\",\n  \"allTemplates\": [\n    { \"key\": \"ophthalmology\",     \"label\": \"Ophthalmology Exam\", \"icon\": \"👁️\" },\n    { \"key\": \"cardiology\",        \"label\": \"Cardiology Exam\",    \"icon\": \"🫀\" },\n    { \"key\": \"neurology\",         \"label\": \"Neurological Exam\",  \"icon\": \"🧠\" },\n    { \"key\": \"orthopedics\",       \"label\": \"Orthopedic Exam\",    \"icon\": \"🦴\" },\n    { \"key\": \"pediatrics\",        \"label\": \"Pediatric Exam\",     \"icon\": \"👶\" },\n    { \"key\": \"pulmonology\",       \"label\": \"Pulmonology Exam\",   \"icon\": \"🫁\" },\n    { \"key\": \"internal_medicine\", \"label\": \"Systems Review\",     \"icon\": \"🩺\" },\n    { \"key\": \"dermatology\",       \"label\": \"Dermatology Exam\",   \"icon\": \"🧬\" },\n    { \"key\": \"obgyn\",             \"label\": \"OB/GYN Exam\",        \"icon\": \"🤰\" },\n    { \"key\": \"psychiatry\",        \"label\": \"Mental Status Exam\", \"icon\": \"🧠\" },\n    { \"key\": \"ent\",               \"label\": \"ENT Exam\",           \"icon\": \"🏥\" }\n  ]\n}\n\n— Physician profile exists but specialty matches no alias: identical shape with \"template\": null, \"specialty\": \"<their raw specialty string>\", and the full 11-item allTemplates. —\n\n— NO PhysicianProfile row (early return at L35), only 2 keys: —\n{ \"template\": null, \"allTemplates\": [] }\n(the \"specialty\" key is ABSENT, not null, and allTemplates is EMPTY even though the 11 templates exist)",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "500 {\"error\":\"Failed to load specialty template\"} on any throw (e.g. DB down)"
+      ],
+      "requestBody": [],
+      "requestQuery": [],
+      "dbWrites": [],
+      "crossModelReads": [
+        "PhysicianProfile"
+      ],
+      "externalDeps": [
+        "server/src/config/specialtyTemplates.js (lazily require()d inside the handler): getTemplateForSpecialty, SPECIALTY_TEMPLATES"
+      ],
+      "sideEffects": [
+        "None."
+      ],
+      "quirks": [
+        "TWO DIFFERENT RESPONSE SHAPES on 200. With no PhysicianProfile the body is `{template:null, allTemplates:[]}` — the `specialty` key is omitted entirely (not null), and allTemplates is empty rather than the full 11. A typed .NET DTO would emit `\"specialty\": null` and break byte-identity. Two separate response types are needed.",
+        "allTemplates order is JS object insertion order from SPECIALTY_TEMPLATES (specialtyTemplates.js L13-L393): ophthalmology, cardiology, neurology, orthopedics, pediatrics, pulmonology, internal_medicine, dermatology, obgyn, psychiatry, ent. The client renders the dropdown in exactly this order — a .NET Dictionary does not guarantee it, use an ordered list.",
+        "`internal_medicine`'s label is \"Systems Review\", NOT \"Internal Medicine Exam\" — the only label that breaks the \"<X> Exam\" pattern. `psychiatry` is \"Mental Status Exam\".",
+        "`neurology` and `psychiatry` share the SAME icon (brain, U+1F9E0). Icons are not unique keys.",
+        "Icons are multi-codepoint emoji: the eye is U+1F441 + U+FE0F (variation selector). Byte-identical output requires preserving the VS16; dropping it changes the payload.",
+        "FIELD OBJECT KEY ORDER IS NOT UNIFORM across the config and JSON.stringify preserves insertion order. `key, label, type, placeholder` for text fields; `key, label, type, unit, placeholder` for the IOP number fields (unit BEFORE placeholder); `key, label, type, options` for selects. A .NET record with a fixed property order will reorder some fields.",
+        "OPTIONAL FIELD KEYS ARE ABSENT, NOT NULL. Of 117 fields across the 11 templates: 117 have key/label/type, only 93 have `placeholder`, 11 have `unit`, 24 have `options`. Serialization must omit missing keys, never emit `\"unit\": null`.",
+        "SECTION `paired` IS ALSO ABSENT WHEN NOT SET — only 7 of 34 sections carry `paired: true`; the other 27 omit the key. Section key order is `title`, then `paired` (when present), then `fields`.",
+        "Specialty matching is via SPECIALTY_ALIASES (specialtyTemplates.js L399-L456) on `specialty.toLowerCase().trim()`. It is an exact alias-table lookup, NOT fuzzy — \"Obstetrics & Gynecology\" and \"ENT (Ear, Nose, Throat)\" are present as literal aliases because they are the exact strings in specialties.json. 60+ alias keys; port the table verbatim.",
+        "PhysicianProfile.specialty is a NON-NULL String in the schema (L277), so `specialty` in the response is never null when the profile exists.",
+        "No physician/userType gate: a PATIENT gets the degenerate `{template:null, allTemplates:[]}` body, not a 403.",
+        "The config module is require()d INSIDE the handler on every request (Node caches it) — no behavioral consequence, but it means a config throw surfaces as the 500 above, not a boot failure.",
+        "No caching middleware on this route despite the doc comment saying \"Cached on the frontend\" — the server sets no Cache-Control."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/specialty-template/:key",
+      "nodeLines": "L61-L71",
+      "summary": "Returns one full template definition by key, wrapped in a `template` envelope. Pure config lookup, no DB access at all.",
+      "auth": "router.use(authCheck) only. NO physician gate, NO ownership gate, NO DB query whatsoever — any authenticated user can read any template. Declared at L61, BEFORE router.get('/:id') at L272, so it is not shadowed.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"template\": {\n    \"key\": \"cardiology\",\n    \"label\": \"Cardiology Exam\",\n    \"icon\": \"🫀\",\n    \"sections\": [\n      { \"title\": \"Cardiac Symptoms\", \"fields\": [\n          { \"key\": \"chest_pain\", \"label\": \"Chest Pain\", \"type\": \"select\", \"options\": [\"None\",\"Typical angina\",\"Atypical angina\",\"Nonanginal\",\"Unspecified\"] },\n          { \"key\": \"nyha_class\", \"label\": \"NYHA Class\", \"type\": \"select\", \"options\": [\"I\",\"II\",\"III\",\"IV\"] },\n          { \"key\": \"palpitations\", \"label\": \"Palpitations\", \"type\": \"select\", \"options\": [\"None\",\"Intermittent\",\"Persistent\"] },\n          { \"key\": \"syncope\", \"label\": \"Syncope/Pre-syncope\", \"type\": \"select\", \"options\": [\"None\",\"Pre-syncope\",\"Syncope\"] } ] },\n      ...\n    ]\n  }\n}\n\nExactly ONE top-level key, `template`, holding the identical object structure that GET /specialty-template returns in its `template` slot: {key, label, icon, sections:[{title, paired?, fields:[{key, label, type, placeholder?, unit?, options?}]}]}. `sections` and `fields` are always non-empty arrays for the 11 real keys. Field `type` is one of: text | number | select | date | textarea.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "404 {\"error\":\"Template not found\"} when SPECIALTY_TEMPLATES[key] is falsy",
+        "500 {\"error\":\"Failed to load template\"} on any throw"
+      ],
+      "requestBody": [],
+      "requestQuery": [],
+      "dbWrites": [],
+      "crossModelReads": [],
+      "externalDeps": [
+        "server/src/config/specialtyTemplates.js (lazily require()d inside the handler): SPECIALTY_TEMPLATES only"
+      ],
+      "sideEffects": [
+        "None."
+      ],
+      "quirks": [
+        "Path as written is `/specialty-template/:key`. Valid keys are exactly the 11 template keys, NOT the alias strings — `GET /specialty-template/eye` returns 404 even though \"eye\" is a valid alias for GET /specialty-template's matching. Only the aliasing endpoint resolves aliases; this one is a raw key lookup.",
+        "PROTOTYPE-CHAIN LEAK: SPECIALTY_TEMPLATES is a plain JS object literal, so `SPECIALTY_TEMPLATES[req.params.key]` resolves Object.prototype members. `GET /specialty-template/constructor` (also toString, valueOf, hasOwnProperty, isPrototypeOf, propertyIsEnumerable, toLocaleString) returns 200 with body `{}` — the Object constructor is truthy so no 404 fires, and JSON.stringify of a function yields an omitted key, collapsing the whole response to `{}`. `GET /specialty-template/__proto__` returns 200 `{\"template\":{}}`. A .NET Dictionary lookup would correctly 404 on all of these — if any client depends on the non-404, that is a behavior change; flag it rather than silently altering it.",
+        "Zero DB queries — this route never touches Prisma, so it works even with the database down (only authCheck can fail).",
+        "No physician gate: a PATIENT-typed user can enumerate all 11 clinical templates.",
+        "Response is WRAPPED (`{template: ...}`), unlike a bare object — and unlike GET /specialty-template it carries NO `specialty` and NO `allTemplates` keys.",
+        "Same absent-vs-null and key-order constraints as GET /specialty-template: `placeholder`/`unit`/`options` keys are omitted when unset (never null), section `paired` omitted when not true, and per-field key order follows the config literal, which is inconsistent across fields (number fields put `unit` before `placeholder`).",
+        "The client calls this three ways — on saved-__templateKey restore, on picker switch, and on AI-suggested specialtyKey (client/src/components/SpecialtyExamCard.jsx L50, L86; client/src/components/VisitTemplatePicker.jsx) — and treats any error as \"no template\" (setTemplate(null)) via a bare .catch, so it never surfaces the 404 body."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/:id/generate-soap",
+      "nodeLines": "L674-L938",
+      "summary": "AI scribe: turns visit.rawNotes (or rawTranscript) into the four SOAP sections via a provider-chain LLM call, optionally runs a SECOND LLM call to extract structured specialty exam fields, persists all of it onto the Visit, and returns the generated text plus AI metadata. Has a non-AI template fallback that returns a DIFFERENT response shape with 200.",
+      "auth": "router.use(authCheck) -> aiUsageCheck('soap') (server/src/services/aiUsageLimiter.js L118-L189). aiUsageCheck runs BEFORE any visit lookup, so plan/limit rejections precede 404/403. In-handler gate: visit exists -> caller has a PhysicianProfile AND visit.physicianId === physician.id. NO visit.status check.",
+      "successStatus": 200,
+      "responseShape": "— AI PATH (the try block succeeded), 11 keys in this exact order: —\n{\n  \"message\": \"SOAP note generated by AI. Review and edit as needed.\",\n  \"subjective\": \"<string, may be \\\"\\\">\",\n  \"objective\":  \"<string, may be \\\"\\\">\",\n  \"assessment\": \"<string, may be \\\"\\\">\",\n  \"plan\":       \"<string, may be \\\"\\\">\",\n  \"aiProvider\": \"gemini\" | \"openai\" | \"micromind\",\n  \"aiModel\":    \"gemini-2.0-flash\" | \"gpt-4o\" | \"micromind-agent\",\n  \"enhanced\":   false,\n  \"aiUsage\":    { \"used\": 12, \"limit\": 50, \"remaining\": 38, \"tier\": \"FREE\" } | null,\n  \"specialtyData\": { \"iop_od\": \"14\", \"iop_os\": \"15\", \"__templateKey\": \"ophthalmology\" } | null,\n  \"specialtyKey\":  \"ophthalmology\" | null\n}\nWhen `enhance` is truthy the message is instead \"SOAP note generated with GPT-4o (enhanced). Review and edit as needed.\" and \"enhanced\": true.\nThe four SOAP values are read back from the UPDATED DB row, so they are exactly what was persisted — always strings, possibly empty (\"\"), never null on this path.\n\n— AI-FAILURE / TEMPLATE-FALLBACK PATH (inner catch at L905, still HTTP 200), only 6 keys: —\n{\n  \"message\": \"SOAP note generated (template — AI unavailable). Edit as needed.\",\n  \"subjective\": \"Patient presents with: <chiefComplaint|unspecified complaint>.\\n\\nPatient reports:\\n<first third of non-blank source lines | (See raw notes)>\",\n  \"objective\":  \"Physical examination findings:\\n<middle third | (Pending examination documentation)>\",\n  \"assessment\": \"Clinical assessment:\\n<last third | (Pending clinical assessment)>\",\n  \"plan\":       \"Treatment plan:\\n- Follow-up as needed\\n- <visit.followUpNotes | Continue monitoring>\",\n  \"aiProvider\": \"template\"\n}\n`aiModel`, `enhanced`, `aiUsage`, `specialtyData`, `specialtyKey` ARE COMPLETELY ABSENT on this path — not null, absent.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "401 {\"error\":\"Authentication required\"} from aiUsageCheck when req.user.id is missing",
+        "401 {\"error\":\"User not found\"} from aiUsageCheck when the User row is gone",
+        "403 {\"error\":\"Feature not available on your plan\", \"message\":\"The AI SOAP Generator feature requires a Pro subscription.\", \"upgradeRequired\":true, \"currentTier\":\"PATIENT_FREE\"} when the tier's allowedAgents excludes 'soap' (PATIENT_FREE and PATIENT_FAMILY only allow 'health_chat') — fires BEFORE the visit lookup",
+        "429 {\"error\":\"Monthly AI limit reached\", \"message\":\"You've used 50/50 AI calls this month. Upgrade to Pro for more.\", \"upgradeRequired\":true, \"currentTier\":\"FREE\", \"usage\":{\"used\":50,\"limit\":50,\"totalTokens\":123,\"totalCost\":0.01,\"resetsAt\":\"2026-10-01T00:00:00.000Z\"}} when the monthly count is at/over the tier cap",
+        "404 {\"error\":\"Visit not found\"} when the Visit row does not exist",
+        "403 {\"error\":\"Not your visit\"} when caller has no PhysicianProfile or does not own the visit",
+        "400 {\"error\":\"No notes or transcript to process\"} when BOTH visit.rawNotes and visit.rawTranscript are falsy",
+        "500 {\"error\":\"Failed to generate SOAP note\"} from the OUTER catch — reachable only for failures outside the AI try/catch (e.g. the initial visit/physician queries throwing). An AI failure does NOT 500; it returns the 200 template fallback."
+      ],
+      "requestBody": [
+        "enhance: boolean (optional, truthy-checked; selects the 'soap_enhanced' agent, raises maxTokens 2000->3000, and changes the message text and `enhanced` flag)",
+        "specialtyKey: string (optional; highest-priority template selector, only honored if it is a real SPECIALTY_TEMPLATES key)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits (UPDATE) — subjective, objective, assessment, plan, plus specialtyData ONLY when the extraction call added >=1 field. NOT in a transaction.",
+        "ai_audit_logs (INSERT) — written fire-and-forget by aiGateway.logAudit for EACH chat call (1 for SOAP + 1 for the specialty extraction), only when metadata.userId is set. Errors are swallowed."
+      ],
+      "crossModelReads": [
+        "User (in aiUsageCheck)",
+        "AiAuditLog (aggregate count in aiUsageCheck; insert in the gateway)",
+        "PhysicianProfile",
+        "FamilySubprofile",
+        "Allergy",
+        "ChronicCondition",
+        "CurrentMedication"
+      ],
+      "externalDeps": [
+        "server/src/services/aiGateway.js -> chat() twice: OpenAI SDK (chat.completions, 30s timeout) and/or @google/generative-ai and/or the MicroMind HTTP endpoint",
+        "server/src/config/specialtyTemplates.js: getTemplateForSpecialty, formatSpecialtyDataForPrompt, getFieldMapForPrompt, SPECIALTY_TEMPLATES",
+        "server/src/services/aiUsageLimiter.js: aiUsageCheck('soap')"
+      ],
+      "sideEffects": [
+        "Overwrites all four SOAP columns on the Visit unconditionally.",
+        "May overwrite visit.specialtyData with a merged object (existing keys preserved, extracted keys added, plus __templateKey).",
+        "Writes 1-2 AiAuditLog rows.",
+        "Populates the aiGateway in-process LRU cache (200 entries, 1h TTL by default) keyed on sha256(system+user).",
+        "No notifications, no cache invalidation."
+      ],
+      "quirks": [
+        "NO visit.status GUARD. PUT /:id refuses to edit a COMPLETED visit (400 \"Cannot edit a completed visit\"), but this endpoint happily regenerates and overwrites the SOAP note of a COMPLETED visit — including one already shared with the patient. This is a real hole a faithful port must copy.",
+        "`source = visit.rawNotes || visit.rawTranscript || ''` — rawNotes WINS. If rawNotes is non-empty the voice transcript is silently ignored, even a much longer one.",
+        "THE TEMPLATE FALLBACK RETURNS 200 WITH A 6-KEY BODY, missing aiModel/enhanced/aiUsage/specialtyData/specialtyKey entirely. Two distinct response DTOs are required; emitting nulls for the missing keys is not byte-identical.",
+        "The inner try/catch wraps the DB update too, so a failed prisma.visit.update inside the AI path falls through to the template fallback, which then attempts a SECOND update with template text. A DB-level failure can therefore silently replace real AI output with boilerplate.",
+        "`aiUsage` for the CLINIC tier is `{used: 0, limit: Infinity, remaining: Infinity, tier: 'CLINIC'}` and JSON.stringify turns Infinity into null -> the wire body is `{\"used\":0,\"limit\":null,\"remaining\":null,\"tier\":\"CLINIC\"}`. Do not emit a sentinel number or the string \"unlimited\".",
+        "aiUsageCheck FAILS OPEN: any error inside it calls next() without setting req.aiUsage, so the response carries `\"aiUsage\": null`. Over-limit users get through when the limiter's own DB query fails.",
+        "The limiter's agent name is 'soap' regardless of `enhance`, so the 403 message always says \"The AI SOAP Generator feature requires a Pro subscription.\" FREE tier DOES allow 'soap' (50 calls/month).",
+        "aiUsageCheck runs before the visit lookup, so a patient hitting this gets 403 upgradeRequired (not 403 \"Not your visit\") and a nonexistent visit id for an over-limit user gets 429 (not 404). Middleware ordering is part of the contract.",
+        "TEMPLATE DETECTION is a 4-step priority chain (L724-L744): (1) body.specialtyKey if it is a real key; (2) visit.specialtyData.__templateKey if it is a real key; (3) heuristic — walk SPECIALTY_TEMPLATES in insertion order and pick the FIRST template where >=2 of the existing specialtyData keys (excluding __templateKey) match that template's field keys; (4) alias-match physician.specialty. Result may still be null. Reproduce the insertion order or the heuristic picks a different template.",
+        "AGENT-ROUTING MODEL IS DEAD CODE. aiGateway's AGENT_MODEL_DEFAULTS maps soap->{gemini, gemini-2.0-flash} and soap_enhanced->{openai, gpt-4o}, but the handler passes NO `model`, and the gateway only uses agentConfig.PROVIDER for the chain — `model` stays undefined, so chatOpenAI resolves `process.env.OPENAI_MODEL || 'gpt-4o'` and chatGemini resolves `process.env.GEMINI_MODEL || 'gemini-2.0-flash'`. The returned `aiModel` therefore comes from ENV, not from the routing table.",
+        "Provider chain for agent 'soap' is [gemini, AI_PRIMARY_PROVIDER||openai, AI_FALLBACK_PROVIDER||gemini, micromind] de-duped -> typically ['gemini','openai','micromind']; for 'soap_enhanced' -> ['openai','gemini','micromind']. Providers whose API key env var is unset are SKIPPED silently. Only when every provider fails does chat() throw and the template fallback fire.",
+        "THE SOAP CALL IS CACHED. chat()'s `useCache` defaults to true and this handler does not pass it, so identical (system+user) prompts within the 1h TTL return the SAME text from a 200-entry in-process LRU — with `provider`/`model` preserved from the original call. Regenerating twice with unchanged notes yields identical output and no new AI cost. Note the cache is per-process (breaks under PM2 cluster) and the audit row is logged with cached:true, tokensUsed:0.",
+        "SOAP PARSING: regex /(?:^|\\n)\\s*(SUBJECTIVE|OBJECTIVE|ASSESSMENT|PLAN)\\s*:\\s*/gi over the raw text. Sections are only trusted when >=3 markers are found. Each section's value is text.substring(afterHeader, nextHeaderIndex).trim(). A REPEATED header (e.g. the model writing \"PLAN:\" twice) overwrites the earlier capture — last occurrence wins.",
+        "With exactly 3 markers, the missing section stays \"\" (empty string) and is persisted as \"\", so the client receives \"\" — not null, not \"(Not documented)\".",
+        "PARSE-FAILURE BRANCH (<3 markers) still uses the AI path's 11-key response but synthesizes: subjective = \"Patient presents with: <chiefComplaint|unspecified complaint>\" (NO trailing period, unlike the template fallback which HAS one), assessment = the entire raw AI text trimmed, plan = \"Review AI-generated assessment above and edit as needed.\", objective = \"\" (empty).",
+        "SECOND AI CALL (specialty extraction) runs only when activeTemplateKey is set AND getFieldMapForPrompt returns a non-empty string. Its agent is 'specialty_extract', which is NOT in AGENT_MODEL_DEFAULTS, so it uses the plain [primary, fallback, micromind] chain — a DIFFERENT provider from the SOAP call. temperature 0.1, maxTokens 500. Its failures are fully swallowed (logged only).",
+        "Extraction JSON is recovered with `rawExtract.match(/\\{[\\s\\S]*\\}/)` — a GREEDY brace match, so prose or code fences around the JSON are tolerated but nested trailing braces can corrupt it. Parse failure -> mergedSpecialtyData stays null.",
+        "EXTRACTED VALUES ARE COERCED WITH String(value) but pre-existing specialtyData values are copied through UNTOUCHED. So the same object can mix a numeric 14 (old) and a string \"14\" (new). Empty string / null / undefined extracted values are skipped.",
+        "`specialtyData` in the response is `mergedSpecialtyData || null` — it is null whenever the extraction ran but added zero fields, even though visit.specialtyData in the DB is unchanged and non-empty. The response key does NOT mirror the DB column.",
+        "`specialtyKey` is returned even when specialtyData is null (it reflects the detected template, not the extraction outcome).",
+        "`enhanced: !!enhance` — coerced, so a body of `enhance: \"yes\"` yields true.",
+        "`aiProvider`/`aiModel` come from the FIRST (SOAP) chat call only; the extraction call's provider is never reported.",
+        "Patient context (allergies / active conditions / active medications) is injected only when visit.subprofileId is set, and the queries filter `isActive: true` for conditions and medications but NOT `deletedAt: null` — SOFT-DELETED conditions and medications still leak into the AI prompt. Allergies are unfiltered entirely.",
+        "The whole patient-context block is wrapped in `try {} catch { }` with an empty catch — a failure yields an empty context, silently.",
+        "aiGateway.chat() throws \"Prompt too long (<n> chars, max 50000)\" for oversized notes; that throw is caught by the inner catch and degrades to the 200 template fallback, so the client never sees the length error.",
+        "Template-fallback thirds are computed on `source.split('\\n').filter(l => l.trim())` — blank lines dropped, but surviving lines keep their original leading/trailing whitespace. Boundaries are Math.ceil(n/3) and Math.ceil(2n/3), so for n=1 the first third takes the only line and the other two are empty -> \"(Pending examination documentation)\" / \"(Pending clinical assessment)\".",
+        "The fallback `plan` interpolates visit.followUpNotes, so it can echo the physician's own follow-up text back into the plan.",
+        "No notification is sent even though the visit's documentation changed."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/:id/suggest-codes",
+      "nodeLines": "L1023-L1119",
+      "summary": "ICD-10 auto-coder: sends the visit's Assessment/Plan/Subjective/Chief Complaint to an LLM, parses a JSON array of code suggestions, sanitizes and de-duplicates against already-assigned codes, and returns at most 8. Read-only with respect to the Visit — it never persists anything.",
+      "auth": "router.use(authCheck) -> aiUsageCheck('icd10'). The limiter runs BEFORE the visit lookup. In-handler gate: visit exists -> caller has a PhysicianProfile AND visit.physicianId === physician.id. NO visit.status check.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"suggestedCodes\": [\n    { \"code\": \"E11.9\", \"description\": \"Type 2 diabetes mellitus without complications\", \"confidence\": 0.92 },\n    { \"code\": \"I10\",   \"description\": \"Essential (primary) hypertension\",              \"confidence\": 0.81 }\n  ],\n  \"aiProvider\": \"gemini\" | \"openai\" | \"micromind\",\n  \"aiModel\": \"gemini-2.0-flash\" | \"gpt-4o\" | \"micromind-agent\"\n}\n\nExactly 3 top-level keys in this order. Each element of suggestedCodes has EXACTLY these 3 keys in this order: code, description, confidence — any extra keys the model emits are dropped by the .map().\n`suggestedCodes` is ALWAYS AN ARRAY, never null, and is `[]` (not null, not absent) when the model output cannot be parsed, when every suggestion is filtered out, or when the array is empty. Max length 8.\n`code` is uppercased and truncated to 10 chars; `description` truncated to 200 chars; `confidence` is a number clamped to [0,1], defaulting to 0.5 when the model omitted it or sent a non-number.\nNothing is written to the DB, so there is no id/visitId on the items — these are transient suggestions the client stages locally.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "401 {\"error\":\"Authentication required\"} / 401 {\"error\":\"User not found\"} from aiUsageCheck",
+        "403 {\"error\":\"Feature not available on your plan\", \"message\":\"The ICD-10 Auto-Coder feature requires a Pro subscription.\", \"upgradeRequired\":true, \"currentTier\":\"PATIENT_FREE\"} when the tier excludes 'icd10' — fires BEFORE the visit lookup",
+        "429 {\"error\":\"Monthly AI limit reached\", \"message\":\"You've used N/LIMIT AI calls this month. Upgrade to Pro for more.\", \"upgradeRequired\":true, \"currentTier\":\"FREE\", \"usage\":{\"used\":N,\"limit\":LIMIT,\"totalTokens\":N,\"totalCost\":N,\"resetsAt\":\"<ISO>\"}}",
+        "404 {\"error\":\"Visit not found\"} when the Visit row does not exist",
+        "403 {\"error\":\"Not your visit\"} when caller has no PhysicianProfile or does not own the visit",
+        "400 {\"error\":\"No SOAP notes or chief complaint to analyze. Generate SOAP first.\"} when assessment+plan+subjective+objective are ALL falsy AND chiefComplaint is falsy",
+        "500 {\"error\":\"Failed to suggest diagnosis codes\"} when ai.chat() throws (all providers failed, or prompt over 50000 chars) — unlike generate-soap there is NO graceful fallback here"
+      ],
+      "requestBody": [
+        "(none — the handler reads no body fields at all; the client posts with no payload)"
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "ai_audit_logs (INSERT) — one row per chat call via the gateway, fire-and-forget. NO write to visits: accepted codes are persisted later by the client via PUT /api/visits/:id { diagnosisCodes }."
+      ],
+      "crossModelReads": [
+        "User (in aiUsageCheck)",
+        "AiAuditLog (aggregate in aiUsageCheck; insert in the gateway)",
+        "PhysicianProfile"
+      ],
+      "externalDeps": [
+        "server/src/services/aiGateway.js -> chat() once with useCache:true, temperature 0.1, maxTokens 1000, metadata.agent 'icd_coder'",
+        "server/src/services/aiUsageLimiter.js: aiUsageCheck('icd10')"
+      ],
+      "sideEffects": [
+        "One AiAuditLog row. Populates the gateway LRU cache. No Visit mutation, no notification, no cache invalidation."
+      ],
+      "quirks": [
+        "AGENT NAME MISMATCH: the rate limiter is keyed 'icd10' (aiUsageLimiter TIER_LIMITS.allowedAgents) but the gateway metadata.agent is 'icd_coder' (which is what AGENT_MODEL_DEFAULTS and the AiAuditLog.agent column see). Two different identifiers for the same feature — port both.",
+        "The 400 gate uses `[assessment, plan, subjective, objective].filter(Boolean).join('\\n')` — so a visit with ONLY objective notes passes the gate, even though `objective` is NEVER sent in the prompt. The user prompt contains only Chief Complaint, Assessment, Plan, and Subjective (each defaulting to the literal \"(Not documented)\" / \"Not specified\").",
+        "THE PROMPT ASKS FOR 2-6 CODES BUT THE CODE SLICES TO 8. Trust the slice.",
+        "The response is capped at 8 AFTER de-duplication, so the client can receive fewer than expected when existing codes overlap.",
+        "`existingCodes = Array.isArray(visit.diagnosisCodes) ? visit.diagnosisCodes.map(c => c.code) : []` — diagnosisCodes is an untyped Json column, so items lacking `.code` contribute `undefined` entries to the exclusion list. If diagnosisCodes is an object (not an array) it is ignored entirely and nothing is excluded.",
+        "Already-assigned codes are BOTH listed in the system prompt as \"do NOT re-suggest\" AND filtered out post-hoc — belt and braces; the filter is authoritative.",
+        "The exclusion filter compares the UPPERCASED, 10-char-truncated candidate against the RAW stored codes. A stored lowercase code (\"e11.9\") will NOT match \"E11.9\" and gets re-suggested.",
+        "PARSING IS ALL-OR-NOTHING AND SILENT. `result.text.replace(/```json\\n?/g,'').replace(/```\\n?/g,'').trim()` then JSON.parse. Any throw -> `suggestedCodes = []` with HTTP 200 and a real aiProvider/aiModel. The client cannot distinguish \"model found no codes\" from \"model output was unparseable\". If result.text is undefined the .replace() TypeError lands in the same catch.",
+        "A non-array parse result (e.g. the model returns an object) is coerced to `[]`.",
+        "`confidence: typeof c.confidence === 'number' ? Math.max(0, Math.min(1, c.confidence)) : 0.5` — NaN IS typeof 'number', so it survives the check, clamps to NaN, and JSON.stringify emits `\"confidence\": null`. A .NET port with a non-nullable double would differ.",
+        "Items are filtered by `c && c.code && c.description` (truthy) BEFORE the map, so empty-string code or description drops the item entirely.",
+        "`String(c.code).toUpperCase().substring(0,10)` — codes are uppercased and hard-truncated; `String(c.description).substring(0,200)` truncates mid-word with no ellipsis. Both truncations are on JS UTF-16 code units, not characters.",
+        "USECACHE IS EXPLICITLY TRUE here (the only route in this file that passes it), so repeated calls on an unchanged visit return byte-identical suggestions from the 1h in-process LRU at zero cost, with the original provider/model echoed back.",
+        "Provider chain: agent 'icd_coder' maps to gemini first -> typically ['gemini','openai','micromind']. As with SOAP, agentConfig.model is never applied, so `aiModel` reflects GEMINI_MODEL/OPENAI_MODEL env values (defaults gemini-2.0-flash / gpt-4o).",
+        "NO `aiUsage` KEY in the response, even though aiUsageCheck populated req.aiUsage. generate-soap returns it; this endpoint drops it.",
+        "The parse-failure log call is `logger.error('[Visits] Failed to parse ICD-10 suggestion response')` — a bare string, no error object, and the catch binds no variable (`catch {}`), so the underlying parse error is unrecoverable from logs.",
+        "No visit.status guard — codes can be suggested for a COMPLETED visit (though the client cannot persist them, since PUT /:id refuses completed visits).",
+        "aiUsageCheck fails open on its own errors, so an over-limit user slips through when the limiter's DB query fails.",
+        "The client reads only `res.data.suggestedCodes` and `res.data.aiProvider` (client/src/pages/VisitDetailPage.jsx L343-L345) and stages accepted codes as `{code, description}` — dropping `confidence` — into the diagnosisCodes array it later PUTs."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/:id/transcribe",
+      "nodeLines": "L964-L1010 (multer instance configured at L946-L962)",
+      "summary": "Medical scribe: accepts a multipart audio upload, transcribes it via OpenAI Whisper (verbose_json), APPENDS the result to visit.rawTranscript with a separator, and returns both this segment and the full accumulated transcript.",
+      "auth": "router.use(authCheck) -> multer upload.single('audio') -> aiUsageCheck('scribe'). NOTE the order: the 25MB body is fully buffered into memory BEFORE the plan/limit check runs. In-handler gate: req.file present -> visit exists -> caller has a PhysicianProfile AND visit.physicianId === physician.id. NO visit.status check.",
+      "successStatus": 200,
+      "responseShape": "{\n  \"transcript\": \"Patient reports intermittent chest pain for three days.\",\n  \"duration\": 12.34,\n  \"language\": \"english\",\n  \"provider\": \"openai\",\n  \"fullTranscript\": \"<prior transcript>\\n\\n--- New recording ---\\n\\n<this transcript>\"\n}\n\nExactly 5 keys in this order.\n- transcript: THIS segment only (Whisper text, \"\" if Whisper returned nothing).\n- duration: seconds as a FLOAT from Whisper's verbose_json (e.g. 12.34), 0 when absent. Not an integer, not milliseconds.\n- language: `transcription.language || <requested language>`. Whisper verbose_json returns a full ENGLISH LANGUAGE NAME (\"english\", \"arabic\"), NOT the ISO code the client sent (\"en\", \"ar\").\n- provider: hardcoded to whatever the gateway returns, which is always the string \"openai\" (Whisper is the only transcription provider).\n- fullTranscript: the entire accumulated visit.rawTranscript AFTER the append.\nThe gateway also returns `model` (\"whisper-1\") and `costUsd`, and the limiter populated req.aiUsage — NONE of those appear in the response.",
+      "errorCases": [
+        "401 {\"error\":\"No token provided\"} / 401 {\"error\":\"Invalid token\"} from authCheck",
+        "500 {\"error\":\"File too large\"} — multer LIMIT_FILE_SIZE (>25MB) is passed to next(err) and handled by the GLOBAL error handler (server/src/index.js L311-L317), which uses `err.status || 500`. MulterError carries no .status, so this is 500, NOT 413.",
+        "500 {\"error\":\"Only audio files are allowed\"} — fileFilter rejection, same global-handler path. NOT 400/415.",
+        "500 {\"error\":\"Unexpected field\"} — multer MulterError when the file part is not named exactly `audio`.",
+        "401 {\"error\":\"Authentication required\"} / 401 {\"error\":\"User not found\"} from aiUsageCheck",
+        "403 {\"error\":\"Feature not available on your plan\", \"message\":\"The Medical Scribe feature requires a Pro subscription.\", \"upgradeRequired\":true, \"currentTier\":\"PATIENT_FREE\"} when the tier excludes 'scribe'",
+        "429 {\"error\":\"Monthly AI limit reached\", \"message\":\"You've used N/LIMIT AI calls this month. Upgrade to Pro for more.\", \"upgradeRequired\":true, \"currentTier\":\"FREE\", \"usage\":{\"used\":N,\"limit\":LIMIT,\"totalTokens\":N,\"totalCost\":N,\"resetsAt\":\"<ISO>\"}}",
+        "400 {\"error\":\"No audio file provided\"} when req.file is undefined (no file part at all)",
+        "404 {\"error\":\"Visit not found\"} when the Visit row does not exist",
+        "403 {\"error\":\"Not your visit\"} when caller has no PhysicianProfile or does not own the visit",
+        "500 {\"error\":\"<raw error.message>\"} from the route's own catch — `error.message || 'Failed to transcribe audio'`. This LEAKS internal messages verbatim, e.g. \"Transcription requires OPENAI_API_KEY (Whisper API)\" or an OpenAI SDK error string. The literal fallback \"Failed to transcribe audio\" only appears when error.message is empty."
+      ],
+      "requestBody": [
+        "multipart/form-data",
+        "audio: file (REQUIRED, field name must be exactly `audio`; memoryStorage; 25MB cap; accepted mimetypes audio/webm, audio/mpeg, audio/wav, audio/mp4, audio/ogg, audio/x-m4a OR anything whose mimetype startsWith 'audio/')",
+        "language: text field (optional; `req.body.language || 'en'`). Parsed by multer, not express.json."
+      ],
+      "requestQuery": [],
+      "dbWrites": [
+        "visits (UPDATE rawTranscript) — single prisma.visit.update, NOT in a transaction, read-modify-write with no optimistic concurrency",
+        "ai_audit_logs (INSERT) — one row via the gateway on both success and failure (tokensUsed null on success, 0 on failure), only when metadata.userId is set"
+      ],
+      "crossModelReads": [
+        "User (in aiUsageCheck)",
+        "AiAuditLog (aggregate in aiUsageCheck; insert in the gateway)",
+        "PhysicianProfile"
+      ],
+      "externalDeps": [
+        "multer (memoryStorage, 25MB limit, custom fileFilter) — instantiated at module scope, L947-L962",
+        "server/src/services/aiGateway.js -> transcribe(): writes the buffer to a temp file at os.tmpdir()/tebrazi_audio_<Date.now()>.webm, calls OpenAI audio.transcriptions.create({model:'whisper-1', response_format:'verbose_json', prompt:'Medical clinical dictation...'}) with a 60s timeout, then fs.unlinkSync in a finally",
+        "server/src/services/aiUsageLimiter.js: aiUsageCheck('scribe')"
+      ],
+      "sideEffects": [
+        "APPENDS to visit.rawTranscript (never replaces).",
+        "Writes one AiAuditLog row.",
+        "Writes and deletes a temp file on the server's tmpdir; the filename uses Date.now() so concurrent requests in the same millisecond can collide.",
+        "No notification, no cache invalidation. Transcription results are NOT cached (only chat() has an LRU)."
+      ],
+      "quirks": [
+        "MULTER RUNS BEFORE aiUsageCheck. A user who is over their monthly limit or on a plan without 'scribe' still uploads and buffers the entire file (up to 25MB) into server memory before being rejected. Middleware order is observable behavior (memory/time), and the port must keep it if it wants identical resource characteristics.",
+        "MULTER FAILURES ARE 500, NOT 4xx. \"File too large\", \"Only audio files are allowed\" and \"Unexpected field\" all bypass the route handler entirely and are rendered by the global error handler as `{error: err.message}` with status 500. The client's VoiceRecorder shows `err.response.data.error` verbatim, so the message text is part of the contract.",
+        "In development (NODE_ENV=development) the global error handler ALSO adds a `stack` key to those multer 500 bodies.",
+        "The fileFilter is effectively wide open for audio: the explicit allow-list is redundant because `|| file.mimetype.startsWith('audio/')` accepts any audio/* type.",
+        "APPEND SEMANTICS: `existing + (existing ? '\\n\\n--- New recording ---\\n\\n' : '') + result.text`. The separator is that EXACT string, only inserted when the prior transcript is non-empty. First recording -> fullTranscript === transcript with no separator. An empty-string prior transcript is treated as absent.",
+        "`req.body.language || 'en'` means the gateway ALWAYS receives a language, so Whisper's auto-detection path (which the gateway supports by omitting `language`) is UNREACHABLE from this route.",
+        "`language` in the response is Whisper's own value, a full lowercase language NAME like \"english\" — NOT the \"en\" the client sent. Only when Whisper omits it does the ISO code sent by the client come back. Do not normalize this to an ISO code.",
+        "`duration` is a float in SECONDS (Whisper verbose_json), 0 when missing. Not ms, not an int.",
+        "The gateway's `model` (\"whisper-1\") and `costUsd` are computed and audited but DELIBERATELY NOT in the response body.",
+        "NO `aiUsage` KEY, unlike generate-soap, even though the limiter populated req.aiUsage.",
+        "NO visit.status GUARD — audio can be transcribed into a COMPLETED visit, appending to a record already shared with the patient.",
+        "The route catch re-exposes raw internal error messages with 500. Notably a missing OPENAI_API_KEY yields 500 {\"error\":\"Transcription requires OPENAI_API_KEY (Whisper API)\"} rather than a 503 or a generic message.",
+        "Whisper retry policy differs from chat: transcribe uses withRetry(fn, 1) = 2 total attempts (chat uses AI_MAX_RETRIES||2 = 3). Retries are skipped for status 400/401/403 and invalid_api_key.",
+        "The temp file is always written with a `.webm` extension regardless of the actual upload mimetype (mp4/m4a audio is still named .webm).",
+        "fs.unlinkSync runs in a `finally`, so a transcription failure still cleans up — but an unlink failure would itself throw out of the finally and surface as the route's 500.",
+        "Read-modify-write on rawTranscript with no locking: two concurrent transcriptions on the same visit lose one segment.",
+        "The client (client/src/components/VoiceRecorder.jsx L110-L113) posts with a 60s axios timeout and reads only `data.transcript`, appending it to the local rawNotes textarea — which is then saved to visit.rawNotes. That is why generate-soap's `rawNotes || rawTranscript` precedence usually resolves to rawNotes."
+      ]
+    }
+  ]
+}
