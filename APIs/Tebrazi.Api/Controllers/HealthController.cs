@@ -43,7 +43,10 @@ public sealed class HealthController(IdentityDbContext dbContext, IHostEnvironme
         return StatusCode(isHealthy ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable, new
         {
             status = isHealthy ? "ok" : "degraded",
-            timestamp = DateTime.UtcNow.ToString("O"),
+            // Node sends `new Date().toISOString()` — three fractional digits. Handing the
+            // serializer a DateTime rather than a pre-formatted string routes it through
+            // NodeDateTimeJsonConverter; ToString("O") printed seven digits.
+            timestamp = DateTime.UtcNow,
             service = "Tebrazi API (.NET)",
             version = typeof(HealthController).Assembly.GetName().Version?.ToString() ?? "1.0.0",
             environment = environment.EnvironmentName,

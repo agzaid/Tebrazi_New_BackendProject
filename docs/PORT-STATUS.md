@@ -196,10 +196,37 @@ marker out of `appointments.notes`, never `waiting_queues`. It returns fully rea
 
 ## Open cross-cutting decisions — these need a call
 
-1. **DateTime wire format.** Node emits `"2026-09-10T00:00:00.000Z"`; `System.Text.Json` writes
-   `"2026-09-10T00:00:00Z"`, dropping zero fractional digits. This affects **every timestamp on
-   every endpoint** and needs a `JsonConverter<DateTime>` in the host. Now that 100 endpoints are
-   routed, this is the single highest-value remaining fidelity fix.
+1. **DateTime wire format — RESOLVED 2026-09-18, was decision #1.** Node emits
+   `"2026-09-10T00:00:00.000Z"`; `System.Text.Json` dropped the zero fractional digits
+   (`"2026-09-10T00:00:00Z"`) and emitted seven of them when they were not zero. The slot is kept
+   rather than renumbered because the other six are referenced by number elsewhere.
+
+   `APIs/Tebrazi.Common.Api/Serialization/NodeDateTimeJsonConverter.cs` now formats every
+   `DateTime` as `yyyy-MM-dd'T'HH:mm:ss.fff'Z'`, registered in `Program.cs:55`. `Unspecified` is
+   treated as already-UTC rather than converted — every instant in the model is UTC
+   (`BaseDbContext` stamps the Kind on read), and `ToUniversalTime()` on an Unspecified value
+   shifts it by the server offset. Sub-millisecond ticks are truncated, which is what a Prisma
+   row would have held anyway. Reading still goes through `Utf8JsonReader.GetDateTime()`, so
+   request binding is unchanged.
+
+   Same pass fixed `HealthController.cs:46`, which built its own string with `ToString("O")` —
+   seven fractional digits — and so bypassed any converter. It hands the serializer a `DateTime`
+   now. A grep of `APIs/`, `Modules/` and `Kernel/` for `ToString("O")` returns no other hit; the
+   four remaining hand-written `.fff` sites are strings inside stored JSON blobs, not response
+   timestamps.
+
+   **Verified**, two ways. Serializing a mixed object through the host's own options printed
+   `.000Z` for a zero fraction, truncated sub-millisecond ticks, left an `Unspecified` value
+   unshifted, converted a `Local` one, and preserved `null` through the nullable wrapper; `node -e`
+   on the same four instants printed byte-identical strings. Live, `GET /api/health` returned
+   `"timestamp":"2026-09-18T16:42:34.690Z"`, which satisfies
+   `new Date(t).toISOString() === t`. Build measured the same day:
+   `dotnet build Tebrazi.Backend.sln --no-incremental` → **0 errors, 216 warnings**, the
+   pre-existing count; the converter adds none.
+
+   **Not checked:** no ported endpoint's full response has been diffed against live Node. The
+   claim is that the format is now Node's, not that any given payload matches — that is what the
+   contract-comparison suite is for.
 2. **The global body sanitizer** (`server/src/index.js:55-81`) mutates every request string
    before the Node handlers see it — it strips `onw+=` patterns, so `"onset = 3 days ago"` loses
    text, and a value that sanitizes to `""` is stored as NULL. Not ported, so stored prose

@@ -297,8 +297,9 @@ them. Confirm no duplicate rows.
 - **Schema drift.** Eight contexts and their migrations must be applied to every clinic's local
   database. An agent on an older schema will produce payloads the cloud rejects — version the agent
   and refuse to sync across a mismatch rather than failing per-operation.
-- **`DateTime` wire format** is already an open decision (`PORT-STATUS.md` #1): Node emits
-  `.000Z`, `System.Text.Json` does not. Sync payloads inherit it. Fix it centrally first.
+- **`DateTime` wire format** was `PORT-STATUS.md` decision #1 and is **fixed as of 2026-09-18** —
+  `NodeDateTimeJsonConverter` pins every timestamp to Node's `.fffZ`. Sync payloads inherit the
+  fix, provided they go through the host's MVC serializer options rather than their own.
 - **SQL Server NULL-distinctness** is already recorded (`PORT-STATUS.md` #4) and bites harder here —
   a unique index that behaves differently locally and centrally makes an operation succeed on one
   side and fail on the other.
