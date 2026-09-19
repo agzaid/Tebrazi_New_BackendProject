@@ -64,19 +64,15 @@ public sealed record PatientDashboardProfile(
     int MedicationsCount);
 
 /// <summary>
-/// A connected doctor (patients.js:723-730).
-///
-/// <para><b>Never populated by this port.</b> It is projected from
-/// <c>DoctorPatientConnection</c>, and the Connections module is not ported — see the remarks on
-/// <see cref="PatientDashboardResponse"/>'s handler. The record stands so the intended shape is
-/// recorded rather than guessed at when Connections lands.</para>
+/// One connected-doctor card. <c>ConnectedAt</c> is nullable because the column is — Node
+/// emits <c>connectedAt: null</c> for an ACCEPTED row whose stamp was never set.
 /// </summary>
 public sealed record PatientDashboardDoctor(
     string Id,
     string Name,
     string Specialty,
     bool Verified,
-    DateTime ConnectedAt,
+    DateTime? ConnectedAt,
     string ForMember);
 
 /// <summary>

@@ -504,6 +504,7 @@ public sealed class GetPatientDashboardHandler(
     IHealthRecordStore records,
     IFamilySubprofileStore subprofiles,
     IIdentityDirectory identity,
+    IConnectionDirectory connections,
     IClinicDirectory clinics,
     IVisitDirectory visits,
     IAppointmentDirectory appointments,
@@ -653,6 +654,43 @@ public sealed class GetPatientDashboardHandler(
                 account.MemberName(v.SubprofileId)))
             .ToList();
 
+        // patients.js:702-730 — the ACCEPTED connections, newest first, via the published
+        // IConnectionDirectory. Status-only filter per Node: one doctor connected for self and
+        // two dependants is THREE rows, each its own card with its own forMember.
+        var acceptedConnections = await connections.ListAcceptedDoctorsForPatientAsync(userId, cancellationToken);
+
+        var doctors = new List<PatientDashboardDoctor>(acceptedConnections.Count);
+        foreach (var connection in acceptedConnections)
+        {
+            // patients.js:719-723. Node's include carries `physicianUser: { id, displayName,
+            // physicianProfile: { specialty, verified } }` and then dereferences
+            // `c.physicianUser.id` with no guard — a dangling physicianUserId raises a TypeError
+            // into the route's 500. Throwing here reproduces that; the guard wrapper answers
+            // the same body.
+            var physicianUser = await identity.GetUserAsync(connection.PhysicianUserId, cancellationToken)
+                ?? throw new InvalidOperationException(
+                    $"DoctorPatientConnection references user {connection.PhysicianUserId}, which could not "
+                    + "be resolved through IIdentityDirectory. Node dereferences "
+                    + "c.physicianUser.id (patients.js:719) and raises a TypeError here.");
+
+            // patients.js:722-723 — `?.specialty || 'General'` and `?.verified || false` for a
+            // user with no PhysicianProfile row.
+            var physicianProfile = await identity.GetPhysicianByUserIdAsync(connection.PhysicianUserId, cancellationToken);
+
+            doctors.Add(new PatientDashboardDoctor(
+                Id: connection.PhysicianUserId,
+                Name: physicianUser.DisplayName,
+                Specialty: PatientOverviewJs.Truthy(physicianProfile?.Specialty) ?? "General",
+                Verified: physicianProfile?.Verified ?? false,
+                ConnectedAt: connection.ConnectedAt,
+                ForMember: account.MemberName(connection.SubprofileId)));
+        }
+
+        var totalDoctors = acceptedConnections
+            .Select(c => c.PhysicianUserId)
+            .Distinct()
+            .Count();
+
         return new PatientDashboardResponse(
             Profile: new PatientDashboardProfile(
                 user.DisplayName,
@@ -664,12 +702,12 @@ public sealed class GetPatientDashboardHandler(
                 account.OwnConditions.Count(c => c.IsActive),
                 account.OwnMedications.Count(m => m.IsActive)),
 
-            // patients.js:702-730. DoctorPatientConnection is not ported — the Connections module
-            // is "not started" (docs/PORT-STATUS.md:23) and no directory port reaches it — so the
-            // connected-doctor list and stats.totalDoctors below are EMPTY where live Node
-            // returns real rows. Unlike `reminders`, this Node query has no `.catch`, so this is
-            // a genuine gap and not a reproduction. Nothing is fabricated in its place.
-            Doctors: [],
+            // patients.js:702-730 — resolved above from IConnectionDirectory. Landed
+            // 2026-09-18; the field had been empty since the module's first pass because
+            // Connections was not yet ported, though `IConnectionDirectory` was published and
+            // implemented on 2026-09-11. Note `ConnectedAt` is DateTime? — a nullable column,
+            // and Node emits `connectedAt: null` for an accepted row that predates the stamp.
+            Doctors: doctors,
 
             Medications: medications,
 
@@ -701,9 +739,9 @@ public sealed class GetPatientDashboardHandler(
             Reminders: [],
 
             Stats: new PatientDashboardStats(
-                // Would be `new Set(connections.map(c => c.physicianUser.id)).size`. Zero for the
-                // same reason `doctors` is empty.
-                TotalDoctors: 0,
+                // patients.js:855 — `new Set(connections.map(c => c.physicianUser.id)).size`,
+                // computed above over the SAME list as doctors[], so both agree by construction.
+                TotalDoctors: totalDoctors,
                 TotalVisits: totalVisits,
                 // The MERGED array's length — self-reported plus every flattened drug line — not
                 // either half's, and capped in practice by the two takes above.

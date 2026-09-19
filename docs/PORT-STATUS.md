@@ -48,7 +48,7 @@ They belong with the parity extras above, which is where they now are.
 | Module | Client endpoints | Done | Status |
 |---|---:|---:|---|
 | Clinics — `/api/clinics` | 18 | **18** | complete (19 live incl. `/roles`) |
-| Patients — `/api/patients` | 25 | **25** | complete — `dashboard.doctors[]` now UNBLOCKED but still unwired, see below |
+| Patients — `/api/patients` | 25 | **25** | complete — `dashboard.doctors[]` wired 2026-09-19, see below |
 | Identity — `/api/auth` | 17 | **12** | login, register + 10 landed 2026-09-18 — 5 of the 17 do not exist in Node and 404 there too (see below) |
 | Manager | 52 | 0 | not started |
 | Connections — `/api/connections` | 21 | **21** | complete (19 Node registrations + 2 client-called routes Node never implemented) |
@@ -83,18 +83,20 @@ Prescriptions publish. Patients is endpoint-complete.
 
 | Endpoint | Was blocked on | Now |
 |---|---|---|
-| `GET /api/patients/dashboard` | Visits, Appointments, Prescriptions | done — one field short, see below |
+| `GET /api/patients/dashboard` | Visits, Appointments, Prescriptions | done |
 | `GET /api/patients/health-summary` | Visits, Prescriptions, Investigations | done |
 | `GET /api/patients/medications/reconciled` | Prescriptions — it diffs reported vs prescribed | done |
 
-**`GET /dashboard` is one field short of contract-complete, and the blocker is now GONE.**
-`doctors[]` and `stats.totalDoctors` project `DoctorPatientConnection` and are still emitted
-empty. The Node query has **no `.catch`**, so live Node returns real rows there — a genuine
-shortfall, not a reproduction. As of 2026-09-11 the Connections module publishes and implements
-`IConnectionDirectory`, so the data the Patients handler needs is reachable across the module
-boundary: `dashboard.doctors[]` is **UNBLOCKED**. **Wiring it into the Patients dashboard handler
-is a separate change and has NOT been made** — both fields are still empty today. Nothing is
-fabricated in their place.
+**`GET /dashboard` is contract-complete as of 2026-09-19.** `doctors[]` and
+`stats.totalDoctors` now project `DoctorPatientConnection` through the published
+`IConnectionDirectory` (`PatientOverviewUseCases.cs`, `GetPatientDashboardHandler`): status-only
+ACCEPTED query, newest first, one card per row — `forMember` from `MemberName` — with
+`specialty`/`verified` falling back per Node's `?.specialty || 'General'` / `|| false`, and
+`totalDoctors` as `Distinct().Count()` over the same list. Live-verified on `Tebrazi_Dev` with a
+seeded patient holding two ACCEPTED rows for the SAME physician (self + dependant): two cards,
+`totalDoctors: 1`. A row with no `connected_at` stamp emits `connectedAt: null` without error.
+Engine note: SQL Server orders NULL stamps LAST on DESC; Postgres puts them FIRST — the
+dual-backend diff will disagree on ordering of null-stamped rows until it exists.
 
 **`dashboard.reminders[]` is NOT in that category.** Its Node query filters `isActive` and
 `dueDate`; the Prisma `Reminder` model (`schema.prisma:1518-1543`) has neither — its fields are
@@ -208,7 +210,7 @@ physician-scoped handlers actually run). Findings worth keeping:
 | `GET /appointments/today`, `/appointments`, `/prescriptions`, `/visits`, `/visits/inbox`, `/follow-ups-due`, `/patient/{id}` → 200 empty | Correct: the account owns no appointments or visits yet, and Node's own handlers return `[]`/empty pages for a physician with none. |
 | `GET /appointments/queue?clinicId=…` → `{"queue":[],"summary":{…}}` | Matches Node's `{"queue":[],"summary":{"total":0,"arrived":0,"pending":0,"completed":0,"noShow":0}}`. |
 | `GET /appointments/ai-optimize` → `{"stats":null,"insights":[],"message":"Not enough appointment data…",` + keys | Needs ≥5 appointments in the 90-day window in Node too; the empty-account path is exercised, the populated one is not. |
-| `GET /patients/dashboard` → 200 with `profile:null` and all-empty aggregates | The unwired `doctors:[]` / `stats.totalDoctors:0` divergence below still applies and is visible here. |
+| `GET /patients/dashboard` → 200 with `profile:null` and all-empty aggregates | Captured 2026-09-18, before the wiring below existed; the empty-account shape is unchanged and still correct. |
 | `GET /prescriptions/{id}/pdf` → 404 `Prescription not found` | Plausible; the 404-before-render path is exercised, the rendered-PDF path is not. |
 | 34 write endpoints of the 56 were **not exercised** | They need seeded clinical rows; the capture skips non-GET unless `--allow-writes`, and anon writes only ever reach the 401 gate anyway. |
 
@@ -236,7 +238,7 @@ written before this pass — `VisitReadResponses.cs` alone accounts for 158. Alw
 | `SlotGenerator` refuses to hang | A non-advancing step (negative or empty-array `slotDuration`) yields zero slots here; Node hangs the process. A deliberate refusal to reproduce a denial-of-service. |
 | `POST /appointments/{id}/intake-note` always 500s | Its 200 body **is** the stored `PatientNote` row, and `IPatientNoteWriter` is a no-op, so there is no honest 200. Everything before the write — 400/404/403, physician resolution — is ported for real. |
 | No 429 anywhere | Node's 100 req/min/IP limiter has no counterpart. Matters most where the client fires one request per slot through `Promise.all`. |
-| `GET /patients/dashboard` sends `doctors: []` and `stats.totalDoctors: 0` | Not a reproduction — live Node returns rows. **No longer blocked as of 2026-09-11:** Connections is ported and `IConnectionDirectory` is published and implemented. The Patients dashboard handler has not been changed to consume it, so both fields are still empty. That wiring is the open item, not the module. |
+| `GET /patients/dashboard` used to send `doctors: []` and `stats.totalDoctors: 0` | CLOSED 2026-09-19: the handler now consumes `IConnectionDirectory` — two cards / `totalDoctors: 1` live-verified with a same-physician self+dependant seed, null `connectedAt` emits `null`. See the Patients section above. |
 | The three Patients aggregate endpoints keep the soft-delete query filter | No query in patients.js mentions `deletedAt`, but Node **hard**-deletes allergies, conditions and medications (`prisma.allergy.delete`, patients.js:358), so the column is never set on a live Node row. This port soft-deletes; the filter is what reproduces the hard delete. Ignoring it would resurrect deleted rows into the dashboard counts. |
 | `GET /api/connections/search-physicians` and `POST /api/connections` **work** | Neither has a route registration in connections.js, so both 404 in Node. Both call sites are `client/src/components/PatientOnboardingWizard.jsx` (:68 and :76) and both swallow errors, so the wizard's doctor step has never done anything in production. Same reasoning as the `visits/inbox` row above. `POST /api/connections` creates a **PENDING** edge — the alternative, ACCEPTED, would let a patient grant themselves a physician's chart access unilaterally, which no patient-initiated route in the file does. One line changes it. |
 | `POST /api/connections/request` answers 201/200/4xx where live Node answers 500 | connections.js:160 is `prisma.user.findUnique({ where: { email } })`, but `model User` has **no standalone `@unique` on `email`** — only `@@index([email])` (schema.prisma:132) and `@@unique([email, userType])` (:137). Under the installed `@prisma/client` **5.22.0**, `UserWhereUniqueInput` requires `id`, `phone` or the compound `email_userType`, so this raises `PrismaClientValidationError` into the route's own catch at :227 and answers `500 {"error":"Failed to send connection request"}` **for every call, including a well-formed one**. The port implements the intent via `IIdentityDirectory.GetUserByEmailAsync`. **Evidence is static (schema + pinned package version), not a live pair-run** — the run is still owed, and the finding is not confined to this module: the same pattern is at `clinics.js:440`, `clinics.js:1194` and `organization.js:336`. Consequence to note: with `@@unique([email, userType])` a physician and a patient may share an email and the port passes no `userType`, so it takes whichever row comes first. |
