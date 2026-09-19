@@ -207,20 +207,49 @@ physician-scoped handlers actually run). Findings worth keeping:
 | Result | Reading |
 |---|---|
 | `GET /visits/specialty-template` **byte-matched live Node** | 2085 bytes both sides — envelope `{template, specialty, allTemplates}`, key order, 11 templates and emoji identical. Computed by running Node's own `specialtyTemplates.js` on the same account. |
-| `GET /appointments/today`, `/appointments`, `/prescriptions`, `/visits`, `/visits/inbox`, `/follow-ups-due`, `/patient/{id}` → 200 empty | Correct: the account owns no appointments or visits yet, and Node's own handlers return `[]`/empty pages for a physician with none. |
+| `GET /appointments/today`, `/appointments`, `/prescriptions`, `/visits`, `/visits/inbox`, `/follow-ups-due`, `/patient/{id}` → 200 empty | The 2026-09-18 capture read them as "Node's own handlers return `[]` for a physician with none". The 2026-09-19 live dual-backend diff (row below) corrected that reading for the visits trio: live Node answers 404 there — see the deliberate-divergences row for the shadowing mechanism. |
 | `GET /appointments/queue?clinicId=…` → `{"queue":[],"summary":{…}}` | Matches Node's `{"queue":[],"summary":{"total":0,"arrived":0,"pending":0,"completed":0,"noShow":0}}`. |
 | `GET /appointments/ai-optimize` → `{"stats":null,"insights":[],"message":"Not enough appointment data…",` + keys | Needs ≥5 appointments in the 90-day window in Node too; the empty-account path is exercised, the populated one is not. |
 | `GET /patients/dashboard` → 200 with `profile:null` and all-empty aggregates | Captured 2026-09-18, before the wiring below existed; the empty-account shape is unchanged and still correct. |
 | `GET /prescriptions/{id}/pdf` → 404 `Prescription not found` | Plausible; the 404-before-render path is exercised, the rendered-PDF path is not. |
 | 34 write endpoints of the 56 were **not exercised** | They need seeded clinical rows; the capture skips non-GET unless `--allow-writes`, and anon writes only ever reach the 401 gate anyway. |
 
-**The local-vs-Node diff has never run.** `diff snapshots/node snapshots/dotnet` needs a Node
-snapshot tree, which needs Node running against a LOCAL database. `server/.env` currently points
-`DATABASE_URL` at `aws-1-eu-central-1.pooler.supabase.com` — the production database — and the
-harness refuses non-localhost capture targets unless `--allow-remote` is passed. Do not diff
-against production. The right next step is a local Postgres fixture (schema from
-`prisma/schema.prisma`, seeded to match `Tebrazi_Dev`'s rows) so both backends answer the same
-requests from the same data.
+**The local-vs-Node diff ran for the first time on 2026-09-19.** The Node side now captures
+against a LOCAL Postgres fixture: `docker run --name tebrazi-node-pg -e POSTGRES_USER=tebrazi
+-e POSTGRES_PASSWORD=tebrazi_dev_pw -e POSTGRES_DB=tebrazi_node -p 54329:5432 postgres:16-alpine`,
+schema applied with `prisma db push --schema tools/contract-diff/node-fixture/schema.prisma`
+(its `.env` holds the fixture's `DATABASE_URL`/`DIRECT_URL`; the schema copy exists because the
+real `server/.env` must stay out of reach — see the warning below). 22 of plan.json's 59 cases
+run per capture (writes are skipped without `--allow-writes`); `contract-diff.mjs diff
+snapshots/node snapshots/dotnet` compares them. First run: 19/22 matched. The 3 deltas are
+exactly the deliberate-divergence trio in the findings table (`visits/inbox`,
+`follow-ups-due`, `patient/{id}` — shadowed/unregistered in Node, 404s live; the port answers
+200). Two genuine shape gaps were found and fixed the same day: `/api/health` lacked `redis`
+and carried an extra `environment` key (fixed to Node's key set/order), and `/api` banner
+omitted `dashboards`/`reports`/`documents` from `endpoints` (added).
+
+Fixture mechanics the next session needs to know:
+
+* **Node has never run on this Windows box before 2026-09-19.** The checked-in
+  `server/node_modules` carries Mac-built native modules. `prisma generate` was re-run for the
+  windows query engine, and `bcrypt`'s binding was replaced with the win32 prebuilt from the
+  `node_modules/bcrypt/lib/binding/napi-v3/`; node-pre-gyp refuses because Node 24's ABI 137 has
+  no exact prebuilt name, but the N-API binary is ABI-stable). Expect more of this class if
+  other native modules load.
+* **The Prisma CLI's `.env` load OVERRIDES the process environment.** `cd ../server &&
+  DATABASE_URL=… prisma db push` still hit production Supabase (`Environment variables loaded
+  from .env` wins). This bit once on 2026-09-19 — a `db push --accept-data-loss` ran against
+  production (harmless: post-hoc read-only `migrate diff` proved production already matched
+  `schema.prisma`, so it was a no-op) — and four fixture seed rows were briefly created in
+  production via a node script that relied on `@prisma/client`'s own `.env` load; all four were
+  deleted and verified gone within minutes. Rule: **every** Prisma invocation outside
+  `server/.env`'s intent runs from `tools/contract-diff/node-fixture/` with the fixture `.env`,
+  never from the server directory. The harness's `--allow-remote` gate still covers capture
+  targets; CLI commands have no such guard.
+* JWT secrets differ (`server/.env`'s `JWT_SECRET` vs the .NET dev placeholder), so a token
+  minted by one backend does not validate on the other. The harness handles this by logging in
+  per capture target. When the secrets converge, cross-backend token reuse becomes possible —
+  not needed for the anon/22-case stage.
 
 A note on the build: `dotnet build Tebrazi.Backend.sln` reports **0 warnings**, and that number is
 an artifact — MSBuild skips unchanged projects, so their warnings are never re-emitted. A full
@@ -233,7 +262,7 @@ written before this pass — `VisitReadResponses.cs` alone accounts for 158. Alw
 
 | Divergence | Why |
 |---|---|
-| `GET /api/visits/inbox`, `/follow-ups-due` and `/patient/{id}` **work** | All three 404 in Node — `follow-ups-due` has a handler that `GET /:id` shadows, and the other two have no handler at all. ASP.NET prefers a literal over a parameter, so they resolve correctly the moment they are mapped. The client already handles the correct shapes, so this cannot break it. |
+| `GET /api/visits/inbox`, `/follow-ups-due` and `/patient/{id}` **work** | Proven live on 2026-09-19 by the dual-backend diff: Node answers `follow-ups-due` and `/inbox` with 404 `{"error":"Visit not found"}` — `GET /:id` (visits.js:272) is registered BEFORE `/follow-ups-due` (visits.js:1244), so Express feeds the literal into `:id` and the dedicated handler at :1244 is unreachable dead code; `/patient/{id}` has two path segments, matches nothing, and falls to the app-level 404 (`{"error":"Not Found","message":"Route … not found"}`, byte-matched by this port's `MapFallback`). ASP.NET prefers a literal over a parameter, so the port resolves all three correctly. The client already handles the correct shapes, so this cannot break it. |
 | `cacheMiddleware` not reproduced | Node caches `GET /appointments` and `GET /prescriptions` for 15s, `/prescriptions/summary` and `/visits/follow-ups-due` for 30s, with **no invalidation anywhere**. A fresher response cannot break the client. |
 | `SlotGenerator` refuses to hang | A non-advancing step (negative or empty-array `slotDuration`) yields zero slots here; Node hangs the process. A deliberate refusal to reproduce a denial-of-service. |
 | `POST /appointments/{id}/intake-note` always 500s | Its 200 body **is** the stored `PatientNote` row, and `IPatientNoteWriter` is a no-op, so there is no honest 200. Everything before the write — 400/404/403, physician resolution — is ported for real. |

@@ -51,5 +51,8 @@ data is not your fixture's data. Bring Node up against a local Postgres (see
 per-case `clinicId` as `X-Clinic-Id`. Cases carrying literal `00000000-…` ids are auth'd GETs
 against non-existent rows — they exercise the 404 path, which is a contract.
 
-Status as of 2026-09-18: live against .NET only (22 snapshots). The Node side of the diff has
-never run — see the handoff above for what a local Node fixture needs.
+Status as of 2026-09-19: **dual-backend and live.** The Node side captures against a LOCAL
+Postgres fixture (`docker: tebrazi-node-pg` on :54329, schema pushed via
+`node-fixture/schema.prisma` + its own `.env` — see PORT-STATUS.md "Contract harness" for the
+fixture mechanics, including why the CLI must never run from `server/`). First diff: 19/22
+matched; the 3 deltas are the documented deliberate visits trio.

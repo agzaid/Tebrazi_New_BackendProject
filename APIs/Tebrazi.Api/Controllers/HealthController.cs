@@ -13,7 +13,7 @@ namespace Tebrazi.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api")]
-public sealed class HealthController(IdentityDbContext dbContext, IHostEnvironment environment)
+public sealed class HealthController(IdentityDbContext dbContext)
     : ControllerBase
 {
     private static readonly DateTime StartedAtUtc = DateTime.UtcNow;
@@ -47,11 +47,15 @@ public sealed class HealthController(IdentityDbContext dbContext, IHostEnvironme
             // serializer a DateTime rather than a pre-formatted string routes it through
             // NodeDateTimeJsonConverter; ToString("O") printed seven digits.
             timestamp = DateTime.UtcNow,
-            service = "Tebrazi API (.NET)",
+            service = "Tebrazi API",
             version = typeof(HealthController).Assembly.GetName().Version?.ToString() ?? "1.0.0",
-            environment = environment.EnvironmentName,
             uptime = $"{(int)(DateTime.UtcNow - StartedAtUtc).TotalSeconds}s",
             db = dbStatus,
+            // Key order and key set match src/index.js:144-168 exactly — the contract-diff
+            // harness diffs them (missing `redis` / extra `environment` were breaking
+            // findings on 2026-09-19). No Redis client in this port, so the value is always
+            // Node's "not configured" branch.
+            redis = "not configured",
             latencyMs = stopwatch.ElapsedMilliseconds,
             memory = new
             {
@@ -62,7 +66,10 @@ public sealed class HealthController(IdentityDbContext dbContext, IHostEnvironme
     }
 
     /// <summary>
-    /// <c>GET /api</c> — the service banner the Node app served at the API root.
+    /// <c>GET /api</c> — the service banner the Node app served at the API root
+    /// (src/index.js:279-293). Key set and order match Node's literal; the dashboards/reports/
+    /// documents entries name route families whose Node modules exist even where the port has
+    /// not landed them — the banner advertises the surface, it does not implement it.
     /// </summary>
     [HttpGet("")]
     [AllowAnonymous]
@@ -73,7 +80,10 @@ public sealed class HealthController(IdentityDbContext dbContext, IHostEnvironme
         endpoints = new
         {
             health = "/api/health",
-            auth = "/api/auth/*"
+            auth = "/api/auth/*",
+            dashboards = "/api/dashboards/*",
+            reports = "/api/reports/*",
+            documents = "/api/documents/*"
         }
     });
 }
